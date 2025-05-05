@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emotion Visualization</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 20px;
+        }
+        .data-container {
+            margin-top: 20px;
+        }
+        .data-container div {
+            margin: 10px 0;
+            font-size: 18px;
+        }
+        .error {
+            color: red;
+        }
+    </style>
+</head>
+<body>
+    <h1>Emotion Data Visualization</h1>
+
+    <div class="data-container">
+        <div>
+            <strong>Current Emotion:</strong> <span id="emotion">Loading...</span>
+        </div>
+        <div>
+            <strong>Valence:</strong> <span id="valence">0.00</span>
+        </div>
+        <div>
+            <strong>Arousal:</strong> <span id="arousal">0.00</span>
+        </div>
+    </div>
+
+    <div class="data-container">
+        <h2>Face and Voice Data</h2>
+        <div>
+            <strong>Face Valence:</strong> <span id="face_valence">0.00</span>
+        </div>
+        <div>
+            <strong>Face Arousal:</strong> <span id="face_arousal">0.00</span>
+        </div>
+        <div>
+            <strong>Voice Valence:</strong> <span id="voice_valence">0.00</span>
+        </div>
+        <div>
+            <strong>Voice Arousal:</strong> <span id="voice_arousal">0.00</span>
+        </div>
+    </div>
+
+    <div class="error" id="error-message"></div>
+
+    <script>
+        // Function to fetch emotion data
+        function fetchEmotionData() {
+            fetch('/emotion_data')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Server returned invalid response');
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    // Update the UI with the fetched data
+                    document.getElementById('emotion').textContent = data.emotion || 'Unknown';
+                    document.getElementById('valence').textContent = data.valence.toFixed(2);
+                    document.getElementById('arousal').textContent = data.arousal.toFixed(2);
+
+                    // Face and Voice Data
+                    document.getElementById('face_valence').textContent = data.face.valence.toFixed(2);
+                    document.getElementById('face_arousal').textContent = data.face.arousal.toFixed(2);
+                    document.getElementById('voice_valence').textContent = data.voice.valence.toFixed(2);
+                    document.getElementById('voice_arousal').textContent = data.voice.arousal.toFixed(2);
+                })
+                .catch(error => {
+                    // Display any errors
+                    document.getElementById('error-message').textContent = 'Error fetching emotion data: ' + error.message;
+                });
+        }
+
+        // Fetch data every 2 seconds to keep it up-to-date
+        setInterval(fetchEmotionData, 2000);
+
+        // Initial fetch
+        fetchEmotionData();
+    </script>
+</body>
+</html>
+

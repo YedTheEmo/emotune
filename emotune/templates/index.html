@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Emotion Visualization</title>
+    <title>Emotion Visualization + Music Control</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -17,8 +17,18 @@
             margin: 10px 0;
             font-size: 18px;
         }
+        .controls {
+            margin-top: 30px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            margin: 5px;
+            cursor: pointer;
+        }
         .error {
             color: red;
+            margin-top: 20px;
         }
     </style>
 </head>
@@ -53,41 +63,75 @@
         </div>
     </div>
 
+    <div class="controls">
+        <h2>Music Controls</h2>
+        <button onclick="playMusic()">Play Music</button>
+        <button onclick="stopMusic()">Stop Music</button>
+    </div>
+
     <div class="error" id="error-message"></div>
 
     <script>
-        // Function to fetch emotion data
+        let currentEmotion = "Neutral";  // fallback
+
         function fetchEmotionData() {
             fetch('/emotion_data')
                 .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Server returned invalid response');
-                    }
+                    if (!response.ok) throw new Error('Server returned invalid response');
                     return response.json();
                 })
                 .then(data => {
-                    // Update the UI with the fetched data
-                    document.getElementById('emotion').textContent = data.emotion || 'Unknown';
+                    currentEmotion = data.emotion || "Neutral";
+                    document.getElementById('emotion').textContent = currentEmotion;
                     document.getElementById('valence').textContent = data.valence.toFixed(2);
                     document.getElementById('arousal').textContent = data.arousal.toFixed(2);
 
-                    // Face and Voice Data
                     document.getElementById('face_valence').textContent = data.face.valence.toFixed(2);
                     document.getElementById('face_arousal').textContent = data.face.arousal.toFixed(2);
                     document.getElementById('voice_valence').textContent = data.voice.valence.toFixed(2);
                     document.getElementById('voice_arousal').textContent = data.voice.arousal.toFixed(2);
+
+                    document.getElementById('error-message').textContent = '';
                 })
                 .catch(error => {
-                    // Display any errors
-                    document.getElementById('error-message').textContent = 'Error fetching emotion data: ' + error.message;
+                    document.getElementById('error-message').textContent =
+                        'Error fetching emotion data: ' + error.message;
                 });
         }
 
-        // Fetch data every 2 seconds to keep it up-to-date
-        setInterval(fetchEmotionData, 2000);
+        function playMusic() {
+            const valence = parseFloat(document.getElementById('valence').textContent);
+            const arousal = parseFloat(document.getElementById('arousal').textContent);
+            
+            fetch('/play', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({valence, arousal})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) throw new Error(data.error);
+                alert(`Playing music at V: ${data.valence.toFixed(2)}, A: ${data.arousal.toFixed(2)}`);
+            })
+            .catch(error => {
+                alert('Music error: ' + error.message);
+            });
+        }
 
-        // Initial fetch
-        fetchEmotionData();
+
+        function stopMusic() {
+            fetch('/stop')
+                .then(response => response.json())
+                .then(data => {
+                    alert('Music stopped.');
+                })
+                .catch(error => {
+                    alert('Error stopping music: ' + error.message);
+                });
+        }
+
+        setInterval(fetchEmotionData, 2000);
+        fetchEmotionData(); // Initial call
     </script>
 </body>
 </html>

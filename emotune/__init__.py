@@ -1,29 +1,20 @@
-#from flask import Flask
-#from emotune.routes import init_routes
-#from emotune.emotion_service import EmotionService
-#
-#emotion_service = EmotionService()  # Single shared instance
-#emotion_service.start_background_analysis()
-#
-#def create_app():
-    #app = Flask(__name__)
-    #init_routes(app, emotion_service)  # Pass it in!
-    #return app
-#
-
-
 from flask import Flask
 from .emotion_service import EmotionService
+from .music_engine.music_controller import MusicController
+
 
 def create_app():
     app = Flask(__name__)
     emotion_service = EmotionService()
-    
-    # Initialize routes with the emotion service
+    music_controller = MusicController()
+
+    # Initialize routes with both emotion_service and music_controller
     from .routes import init_routes
-    init_routes(app, emotion_service)
-    
-    # Start the background analysis thread
+    init_routes(app, emotion_service, music_controller)
+
+    # Start background threads
     emotion_service.start_background_analysis()
-    
+    music_controller.start_music_loop(emotion_service)
+
     return app
+

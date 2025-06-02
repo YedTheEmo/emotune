@@ -1,3 +1,0 @@
-[submodule "external/emonet"]
-	path = external/emonet
-	url = https://github.com/face-analysis/emonet.git

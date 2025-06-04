@@ -1,0 +1,3 @@
+[submodule "vendor/emonet"]
+	path = vendor/emonet
+	url = https://github.com/face-analysis/emonet

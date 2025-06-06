@@ -1,6 +1,7 @@
 from typing import Dict, Any
 from .engine_base import MusicEngineBase
 from pythonosc.udp_client import SimpleUDPClient
+from emotune.utils.logging import get_logger
 
 class SonicPiEngine(MusicEngineBase):
     def __init__(self, osc_host='127.0.0.1', osc_port=4557):

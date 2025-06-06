@@ -3,7 +3,6 @@
 EmoTune Main Application
 Run this file to start the complete EmoTune system
 """
-import threading
 import signal
 import sys
 import os
@@ -11,12 +10,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 # from core.session.manager import SessionManager
-from web.app import create_app
-from utils.logging import setup_logging, get_logger
-from utils.data_persistence import EmoTuneDatabase
+from emotune.web.app import create_app
+from emotune.utils.logging import setup_logging, get_logger
+from emotune.utils.data_persistence import EmoTuneDatabase
 
 # Load config
-cfg_path = os.path.join(os.getcwd(), "config", "default.json")
+cfg_path = os.path.join(os.path.dirname(__file__), "config", "default.json")
 with open(cfg_path) as f:
     cfg_dict = json.load(f)
 config = SimpleNamespace(**cfg_dict)
@@ -47,13 +46,6 @@ def main():
 
     # Create Flask app
     app, socketio, session_manager = create_app(db)
-
-    # Start background session processing loop
-    background_thread = threading.Thread(
-        target=session_manager._main_processing_loop,
-        daemon=True
-    )
-    background_thread.start()
 
     emotune_logger.info("Starting EmoTune server on http://localhost:5000")
 

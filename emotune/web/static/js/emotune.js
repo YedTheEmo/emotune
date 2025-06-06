@@ -129,22 +129,12 @@ class EmoTuneClient {
     }
     
     async setupMediaCapture() {
-        try {
-            // Setup video capture for emotion analysis
-            const videoElement = document.getElementById('videoElement');
-            this.videoStream = await navigator.mediaDevices.getUserMedia({
-                video: { width: 640, height: 480 },
-                audio: true
-            });
-            videoElement.srcObject = this.videoStream;
-            
-            // Setup audio context for voice analysis
-            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            console.log('Media capture setup complete');
-        } catch (error) {
-            console.error('Failed to setup media capture:', error);
-            this.showNotification('Camera/microphone access required for emotion monitoring', 'warning');
-        }
+        // DO NOT open the camera or microphone in the browser!
+        // All camera/audio capture is handled by the backend (Python) only.
+        // This prevents resource conflicts and ensures only one process controls the webcam.
+        // If you want a preview, implement a backend-to-frontend streaming solution instead.
+        // This function is now a no-op for safety.
+        console.log('[EmoTune] setupMediaCapture: Camera/mic access is disabled in frontend to avoid resource conflicts.');
     }
     
     updateConnectionStatus(connected) {

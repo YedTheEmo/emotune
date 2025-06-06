@@ -1,4 +1,5 @@
 from typing import Dict, Any
+from emotune.utils.logging import get_logger
 
 class MusicEngineBase:
     def update_parameters(self, params: Dict[str, float]):

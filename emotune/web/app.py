@@ -6,15 +6,13 @@ from flask_socketio import SocketIO, emit
 from types import SimpleNamespace
 from datetime import datetime
 
-from core.session.manager import SessionManager, SessionConfig
-from utils.logging import get_logger
-
-from config.trajectories import TRAJECTORY_TEMPLATES
-from config.music_params import MUSIC_PARAMETERS
+from emotune.core.session.manager import SessionManager, SessionConfig
+from emotune.utils.logging import get_logger
+from emotune.config.trajectories import TRAJECTORY_TEMPLATES
+from emotune.config.music_params import MUSIC_PARAMETERS
 
 from dataclasses import fields
 
-from utils.logging import get_logger
 logger = get_logger()
 
 # Load base config

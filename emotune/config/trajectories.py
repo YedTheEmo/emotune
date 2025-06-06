@@ -1,4 +1,4 @@
-from core.trajectory.planner import TrajectoryType
+from emotune.core.trajectory.planner import TrajectoryType
 from typing import Callable, Dict, Tuple
 import numpy as np
 

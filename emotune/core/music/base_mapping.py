@@ -1,6 +1,7 @@
 import numpy as np
 from typing import Dict, Tuple
 from .parameter_space import MusicParameterSpace
+from emotune.utils.logging import get_logger
 
 class BaseMappingEngine:
     def __init__(self):

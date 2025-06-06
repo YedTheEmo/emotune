@@ -2,6 +2,7 @@ import numpy as np
 from typing import Dict, List, Any
 import math
 from .parameter_space import MusicParameterSpace
+from emotune.utils.logging import get_logger
 
 class MusicRenderer:
     def __init__(self, param_space: MusicParameterSpace):

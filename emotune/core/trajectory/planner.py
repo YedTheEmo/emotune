@@ -5,7 +5,7 @@ from .library import TrajectoryLibrary, TrajectoryType
 from .dtw_matcher import DTWMatcher
 import logging
 
-from utils.logging import get_logger
+from emotune.utils.logging import get_logger
 logger = get_logger()
 
 class TrajectoryStatus(Enum):

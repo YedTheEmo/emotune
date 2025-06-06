@@ -3,7 +3,7 @@ from typing import Dict, Any, Optional
 import numpy as np
 import time
 
-from utils.logging import get_logger
+from emotune.utils.logging import get_logger
 logger = get_logger()
 
 @dataclass

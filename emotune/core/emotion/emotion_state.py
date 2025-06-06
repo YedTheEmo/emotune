@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Any
 import numpy as np
 from typing import TypedDict
 
-from utils.logging import get_logger
+from emotune.utils.logging import get_logger
 logger = get_logger()
 
 class EmotionMean(TypedDict):

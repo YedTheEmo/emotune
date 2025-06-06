@@ -113,3 +113,4 @@ logs/
 
 # EmoTune Misc
 *.db
+face_debug/

@@ -1,7 +1,7 @@
 # config/music_params.py
 
 from typing import Dict
-from core.music.parameter_space import ParameterRange, MusicParam
+from emotune.core.music.parameter_space import ParameterRange, MusicParam
 
 
 MUSIC_PARAMETERS: Dict[str, ParameterRange] = {

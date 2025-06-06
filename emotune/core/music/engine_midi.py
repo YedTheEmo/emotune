@@ -1,6 +1,7 @@
 from typing import Dict, Any
 from .engine_base import MusicEngineBase
 import mido
+from emotune.utils.logging import get_logger
 
 class MidiEngine(MusicEngineBase):
     def __init__(self, midi_port_name: str = None):

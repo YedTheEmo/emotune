@@ -2,7 +2,7 @@ import numpy as np
 from typing import List, Tuple, Dict
 import logging
 
-from utils.logging import get_logger
+from emotune.utils.logging import get_logger
 logger = get_logger()
 
 class DTWMatcher:

@@ -3,7 +3,7 @@ from typing import Dict, List, Callable, Tuple
 from enum import Enum
 import logging
 
-from utils.logging import get_logger
+from emotune.utils.logging import get_logger
 logger = get_logger()
 
 class TrajectoryType(Enum):

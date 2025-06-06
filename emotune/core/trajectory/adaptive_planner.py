@@ -4,7 +4,7 @@ from .planner import TrajectoryPlanner, TrajectoryStatus, TrajectoryType
 import logging
 import time
 
-from utils.logging import get_logger
+from emotune.utils.logging import get_logger
 logger = get_logger()
 
 class AdaptivePlanner(TrajectoryPlanner):

@@ -1,6 +1,6 @@
 import numpy as np
 from typing import Dict, List, Tuple
-from .collector import FeedbackCollector, FeedbackEvent, FeedbackType
+from emotune.core.feedback.collector import FeedbackCollector, FeedbackEvent, FeedbackType
 
 class FeedbackProcessor:
     def __init__(self, collector: FeedbackCollector):

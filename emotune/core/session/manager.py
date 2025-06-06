@@ -6,12 +6,14 @@ from dataclasses import dataclass
 import time
 import queue
 import uuid
+import cv2
 
+from emotune.core.session.state import *
 from ..emotion.emotion_state import EmotionState
 from ..emotion.kalman_filter import KalmanEmotionFilter
+from ..emotion.fusion import EmotionFusion
 from ..emotion.analyzers import EmotionAnalyzer
 from ..emotion.capture import EmotionCapture
-from ..emotion.fusion import EmotionFusion
 from ..trajectory.planner import TrajectoryPlanner
 from ..trajectory.dtw_matcher import DTWMatcher
 from ..trajectory.library import TrajectoryType
@@ -25,7 +27,7 @@ from ..music.engine_tidal import TidalEngine
 from ..music.engine_sonicpi import SonicPiEngine
 from ..music.engine_midi import MidiEngine
 
-from utils.logging import get_logger
+from emotune.utils.logging import get_logger
 logger = get_logger()
 
 @dataclass
@@ -55,7 +57,6 @@ class SessionManager:
         # Threading
         self.emotion_thread = None
         self.music_thread = None
-        self.main_loop_thread = None
         self.capture_thread = None
 
         # Data queues for thread communication
@@ -68,6 +69,13 @@ class SessionManager:
         self.on_music_update: Optional[Callable] = None
         self.on_session_end: Optional[Callable] = None
 
+        # Camera configuration for EmotionCapture
+        self.emotion_capture = EmotionCapture(
+            face_fps=int(self.config.emotion_update_rate),
+            audio_duration=0.5,
+            sample_rate=16000
+        )
+
     def _init_subsystems(self):
         """Initialize all EmoTune subsystems"""
         # Core components
@@ -79,11 +87,6 @@ class SessionManager:
         # Emotion analysis components
         self.emotion_analyzer = EmotionAnalyzer(device=self.config.device)
 
-        self.emotion_capture = EmotionCapture(
-            face_fps=int(self.config.emotion_update_rate),
-            audio_duration=3.0,
-            sample_rate=16000
-        )
         self.emotion_fusion = EmotionFusion()
 
         # Music system
@@ -157,7 +160,7 @@ class SessionManager:
             session_id = str(uuid.uuid4())
             self.current_session_id = session_id
 
-            # Initialize emotion capture
+            # Initialize emotion capture FIRST
             if not self.emotion_capture.start():
                 logger.error("Failed to start emotion capture")
                 raise RuntimeError("Emotion capture start failed")
@@ -175,12 +178,9 @@ class SessionManager:
             if self.config.enable_feedback:
                 self.feedback_collector.reset_session()
 
-            # Start processing threads
+            # Start processing threads AFTER capture is running
             self.capture_thread = threading.Thread(target=self._emotion_capture_loop, name="EmotionCaptureThread")
             self.capture_thread.start()
-
-            self.main_loop_thread = threading.Thread(target=self._main_processing_loop, name="MainProcessingThread")
-            self.main_loop_thread.start()
 
             logger.info(f"Session {session_id} started with trajectory {trajectory_type}, duration {duration}s")
             return session_id
@@ -208,7 +208,7 @@ class SessionManager:
             self.emotion_capture.stop()
 
         # Wait for threads to finish
-        for thread_name, thread in [("capture_thread", self.capture_thread), ("main_loop_thread", self.main_loop_thread)]:
+        for thread_name, thread in [("capture_thread", self.capture_thread)]:
             if thread and thread.is_alive():
                 thread.join(timeout=2.0)
                 if thread.is_alive():
@@ -223,39 +223,67 @@ class SessionManager:
 
     def _emotion_capture_loop(self):
         """Capture emotion data from sensors and queue for processing"""
+        logger.info("[SessionManager] Starting _emotion_capture_loop thread.")
         while not self.shutdown_event.is_set():
             try:
                 # Get data from emotion capture (a dict with keys 'face_frame' & 'audio_chunk')
                 data = self.emotion_capture.get_data()
                 if not data:
+                    time.sleep(0.05)  # Reduce CPU usage if no data
+                    continue
+                logger.debug(f"[SessionManager] emotion_capture.get_data() returned: {type(data)} {list(data.keys()) if data else data}")
+                if not data:
+                    logger.debug("[SessionManager] No data from emotion_capture.get_data(). Waiting...")
                     self.shutdown_event.wait(0.05)
                     continue
 
                 # Explicitly extract the numpy arrays (or None) from the dict
                 face_frame   = data.get('face_frame')
                 audio_chunk  = data.get('audio_chunk')     
+                logger.info(f"[SessionManager] Got data from capture: face_frame={'yes' if face_frame is not None else 'no'}, audio_chunk={'yes' if audio_chunk is not None else 'no'}.")
+                if audio_chunk is not None:
+                    logger.info(f"[SessionManager] Audio chunk shape: {audio_chunk.shape}, dtype: {audio_chunk.dtype}")
 
-                if face_frame is not None or audio_chunk is not None:
+                # Transform keys to match analyzer's expected parameters
+                transformed_data = {}
+                if face_frame is not None:
+                    transformed_data['frame'] = face_frame  # EmotionAnalyzer expects 'frame'
+                if audio_chunk is not None:
+                    transformed_data['audio'] = audio_chunk  # EmotionAnalyzer expects 'audio'
+                # Optionally pass timestamp if needed (but not to analyze)
+                if 'timestamp' in data:
+                    transformed_data['timestamp'] = data['timestamp']
+
+                # Only pass allowed keys to analyze()
+                allowed = {'frame', 'audio', 'sr'}
+                analyze_kwargs = {k: v for k, v in transformed_data.items() if k in allowed}
+
+                if analyze_kwargs:
+                    logger.info(f"[SessionManager] Passing data to emotion_analyzer.analyze: {list(analyze_kwargs.keys())}")
                     # Analyze emotions
-                    analysis_result = self.emotion_analyzer.analyze(
-                        face_frame=face_frame,
-                        audio_chunk=audio_chunk
-                    )
+                    analysis_result = self.emotion_analyzer.analyze(**analyze_kwargs)
+                    logger.info(f"[SessionManager] emotion_analyzer.analyze result: {analysis_result}")
                     
                     # Fuse the emotion data
+                    logger.info("[SessionManager] Passing analysis_result to _fuse_emotion_data...")
                     fused_emotion = self._fuse_emotion_data(analysis_result)
+                    logger.info(f"[SessionManager] _fuse_emotion_data result: {fused_emotion}")
                     
                     if fused_emotion is not None:
                         with self.emotion_data_lock:
                             self.latest_emotion_data = fused_emotion
                         try:
                             self.emotion_data_queue.put_nowait(fused_emotion)
+                            logger.info("[SessionManager] Fused emotion data put into emotion_data_queue.")
                         except queue.Full:
                             try:
                                 self.emotion_data_queue.get_nowait()
                                 self.emotion_data_queue.put_nowait(fused_emotion)
+                                logger.warning("[SessionManager] emotion_data_queue was full, dropped oldest and added new fused_emotion.")
                             except queue.Empty:
-                                pass
+                                logger.error("[SessionManager] emotion_data_queue full and empty on get_nowait().")
+                else:
+                    logger.info("[SessionManager] No valid data to pass to emotion_analyzer.analyze.")
 
                 self.shutdown_event.wait(0.05)  # Use event wait for interruptible sleep
             except Exception as e:
@@ -263,6 +291,7 @@ class SessionManager:
                 self.shutdown_event.wait(0.1)
 
     def _fuse_emotion_data(self, analysis_result: Dict) -> Optional[Dict]:
+        logger.info(f"[SessionManager] _fuse_emotion_data called with: {analysis_result}")
         try:
             face_data = analysis_result.get('face')
             voice_data = analysis_result.get('voice')
@@ -277,10 +306,13 @@ class SessionManager:
                     },
                     'confidence': face_data['confidence']
                 }
+                logger.info(f"[SessionManager] Valid face_data for fusion: {face_dict}")
+            else:
+                logger.info("[SessionManager] No valid face_data for fusion.")
 
             # Build voice dict if valid
             voice_dict = None
-            if voice_data and voice_data.get('confidence', 0) > 0.1:
+            if voice_data and voice_data.get('confidence', 0.1):
                 voice_dict = {
                     'emotions': {
                         'valence': voice_data['emotions']['valence'],
@@ -288,52 +320,29 @@ class SessionManager:
                     },
                     'confidence': voice_data['confidence']
                 }
+                logger.info(f"[SessionManager] Valid voice_data for fusion: {voice_dict}")
+            else:
+                logger.info("[SessionManager] No valid voice_data for fusion.")
 
             # Call fuse_emotions with the correct dict parameters
+            logger.info(f"[SessionManager] Calling emotion_fusion.fuse_emotions(face_data={face_dict}, voice_data={voice_dict})")
             fused_emotion = self.emotion_fusion.fuse_emotions(
                 face_data=face_dict,
                 voice_data=voice_dict
             )
-
+            logger.info(f"[SessionManager] emotion_fusion.fuse_emotions result: {fused_emotion}")
             return fused_emotion
 
         except Exception as e:
             logger.error(f"Error fusing emotion data: {e}")
             return None
 
-    def _main_processing_loop(self):
-        """Main processing loop that coordinates all subsystems"""
-        last_emotion_update = 0.0
-        last_music_update = 0.0
-
-        emotion_interval = 1.0 / self.config.emotion_update_rate
-        music_interval = 1.0 / self.config.music_update_rate
-
-        while not self.shutdown_event.is_set():
-            current_time = time.time()
-            session_time = current_time - self.session_start_time
-
-            # Check if session should end
-            if session_time >= self.config.session_duration:
-                self.stop_session()
-                break
-
-            # Emotion processing
-            if current_time - last_emotion_update >= emotion_interval:
-                self._process_emotion_update(session_time)
-                last_emotion_update = current_time
-
-            # Music processing
-            if current_time - last_music_update >= music_interval:
-                self._process_music_update(session_time)
-                last_music_update = current_time
-
-            self.shutdown_event.wait(0.05)
-
     def _process_emotion_update(self, session_time: float):
         """Process emotion sensing and filtering"""
+        logger.info(f"[SessionManager] _process_emotion_update called at session_time={session_time}")
         try:
             fused_emotion = self._get_current_emotion()  # now returns full dict with mean + covariance
+            logger.info(f"[SessionManager] _get_current_emotion returned: {fused_emotion}")
 
             if fused_emotion is not None:
                 # Kalman expects valence/arousal, not mean/covariance
@@ -348,7 +357,7 @@ class SessionManager:
                     'arousal': filtered_state[1]
                 }
 
-                logger.info(f"Updating emotion with filtered data: {filtered_emotion}")
+                logger.info(f"[SessionManager] Updating emotion with filtered data: {filtered_emotion}")
 
                 # Now also store full uncertainty trace
                 self.emotion_state.update_emotion({
@@ -357,27 +366,44 @@ class SessionManager:
                     'uncertainty_trace': fused_emotion.get('uncertainty')
                 })
 
+                # --- NEW: Map filtered emotion to music parameters, log, and update renderer ---
+                val = filtered_emotion['valence']
+                ar = filtered_emotion['arousal']
+                mapped_params = self.base_mapping.map_emotion_to_parameters(val, ar)
+                logger.info(f"[SessionManager] Mapped music parameters: {mapped_params}")
+                from emotune.utils.logging import log_music
+                log_music(mapped_params, trajectory_type=getattr(self, 'current_trajectory_type', None), trajectory_progress=session_time/self.config.session_duration)
+                self.music_renderer.update_target_parameters(mapped_params)
+                self.music_renderer.current_params = mapped_params.copy()  # Immediate update for frontend
+
+                # Store for frontend emission
+                self._latest_music_parameters = mapped_params.copy()
+
                 target_emotion = self.trajectory_planner.get_current_target()
                 deviation = self.dtw_matcher.compute_trajectory_deviation(
                     self.emotion_state.get_emotion_trajectory(),
                     self.trajectory_planner.current_trajectory,
                     self.trajectory_planner.start_time
                 )
+                logger.info(f"[SessionManager] Target emotion: {target_emotion}, Deviation: {deviation}")
 
                 if self.rl_agent:
+                    logger.info("[SessionManager] Storing RL state...")
                     self._store_rl_state(filtered_emotion, deviation, session_time)
 
                 if self.on_emotion_update:
+                    logger.info("[SessionManager] Calling on_emotion_update callback...")
                     self.on_emotion_update({
                         'emotion': filtered_emotion,
                         'target': target_emotion,
                         'deviation': deviation,
                         'session_time': session_time
                     })
+            else:
+                logger.info("[SessionManager] No fused_emotion available for update.")
 
         except Exception as e:
             logger.error(f"Error in emotion processing: {e}")
-
 
     def _get_current_emotion(self) -> Optional[np.ndarray]:
         """Get current emotion from sensors"""
@@ -385,16 +411,20 @@ class SessionManager:
             # Try to get emotion from queue first (most recent)
             try:
                 emotion_data = self.emotion_data_queue.get_nowait()
+                logger.info(f"[SessionManager] _get_current_emotion got from queue: {emotion_data}")
                 return emotion_data
             except queue.Empty:
+                logger.info("[SessionManager] _get_current_emotion: emotion_data_queue empty.")
                 pass
 
             # Fall back to latest emotion data
             with self.emotion_data_lock:
                 if self.latest_emotion_data is not None:
+                    logger.info(f"[SessionManager] _get_current_emotion using latest_emotion_data: {self.latest_emotion_data}")
                     return self.latest_emotion_data.copy()
 
             # No emotion data available
+            logger.info("[SessionManager] _get_current_emotion: No emotion data available.")
             return None
 
         except Exception as e:
@@ -469,8 +499,13 @@ class SessionManager:
                 trajectory_deviation, emotion_stability
             )
 
-            # Update RL agent with reward
-            self.rl_agent.update_reward(reward)
+            # Store the experience in RL agent's memory
+            self.rl_agent.store_experience(
+                state=self._get_rl_state(session_time),
+                emotion=self.emotion_state.get_current_emotion(),
+                deviation=trajectory_deviation,
+                session_time=session_time
+            )
 
             # Train RL agent periodically
             if int(session_time) % 30 == 0:  # Every 30 seconds
@@ -521,6 +556,14 @@ class SessionManager:
  
     def get_emotion_analysis_status(self) -> Dict:
         """Get detailed emotion analysis status"""
+        camera_status = False
+        try:
+            # Try to check camera status if possible
+            cap = cv2.VideoCapture(self.config.camera_index, cv2.CAP_DSHOW)
+            camera_status = cap.isOpened()
+            cap.release()
+        except Exception:
+            camera_status = False
         return {
             'analyzers_loaded': {
                 'face': hasattr(self.emotion_analyzer, 'face_analyzer'),
@@ -535,7 +578,8 @@ class SessionManager:
             'processing_stats': {
                 'emotion_queue_size': self.emotion_data_queue.qsize(),
                 'has_latest_data': self.latest_emotion_data is not None
-            }
+            },
+            'camera_status': camera_status
         }
 
     def get_current_status(self) -> Dict:
@@ -563,7 +607,7 @@ class SessionManager:
             'current_emotion': self.emotion_state.get_current_emotion(),
             'latest_raw_emotion': safe_tolist(latest_raw_emotion),
             'target_emotion': self.trajectory_planner.get_current_target() if self.running else None,
-            'music_parameters': self.music_renderer.current_params,
+            'music_parameters': getattr(self, '_latest_music_parameters', self.music_renderer.current_params),
             'emotion_capture_running': self.emotion_capture.is_running() if hasattr(self.emotion_capture, 'is_running') else False,
             'queue_size': self.emotion_data_queue.qsize()
         }
@@ -642,3 +686,26 @@ class SessionManager:
             self.music_renderer.update_target_parameters(params)
             music_struct = self.music_renderer.render(params)
             self.music_engine.play(music_struct)
+
+    def process_feedback(self, session_id: str, feedback: dict):
+        """Process feedback received from the client."""
+        if not self.config.enable_feedback:
+            logger.warning("Feedback processing is disabled.")
+            return
+
+        try:
+            # Collect explicit feedback
+            self.feedback_collector.collect_explicit_feedback(
+                rating=feedback.get('rating', 0),
+                context=feedback.get('comments', '')
+            )
+
+            # Optionally process implicit feedback
+            self.feedback_collector.collect_implicit_feedback(
+                interaction_type="feedback_submit",
+                intensity=1.0
+            )
+
+            logger.info(f"Feedback processed for session {session_id}: {feedback}")
+        except Exception as e:
+            logger.error(f"Error processing feedback for session {session_id}: {e}")

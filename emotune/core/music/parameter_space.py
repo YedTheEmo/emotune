@@ -2,6 +2,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Any
 from enum import Enum
+from emotune.utils.logging import get_logger
 
 class MusicParam(Enum):
     TEMPO = "tempo"

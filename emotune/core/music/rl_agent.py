@@ -7,6 +7,9 @@ from collections import deque
 import random
 from typing import Dict, List, Tuple, Optional
 from .parameter_space import MusicParameterSpace
+from emotune.utils.logging import get_logger
+
+logger = get_logger()
 
 class SoftActorCritic:
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, lr: float = 3e-4):

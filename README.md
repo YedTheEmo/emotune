@@ -50,7 +50,7 @@ EmoTune captures and analyzes emotional signals through facial expressions and v
 
 1. **Start the server:**
    ```powershell
-   python -m emotune.main
+   python -m emotune
    ```
 2. **Open the dashboard:**
    - Visit [http://localhost:5000](http://localhost:5000) in your browser.

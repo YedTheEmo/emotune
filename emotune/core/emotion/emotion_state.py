@@ -37,6 +37,7 @@ class EmotionState:
         
     def update_emotion(self, emotion_dist: Any):
         """Update current emotion state with type and structure validation."""
+        logger.debug(f"[EmotionState] update_emotion called with: {emotion_dist}")
         # Type and structure validation
         if not isinstance(emotion_dist, dict):
             logger.warning("Attempted to update emotion with non-dict object. Ignored.")
@@ -67,7 +68,9 @@ class EmotionState:
         emotion_dist['timestamp'] = time.time()
         self.current_emotion = emotion_dist
         self.emotion_history.append(emotion_dist.copy())
-        
+        logger.info(f"[EmotionState] Updated emotion. History length: {len(self.emotion_history)}. Latest: {emotion_dist}")
+        logger.info(f"[EmotionState] emotion_history length after append: {len(self.emotion_history)}")
+
     def add_raw_observation(self, observation: Dict):
         """Add raw observation to history"""
         observation['timestamp'] = time.time()
@@ -86,7 +89,8 @@ class EmotionState:
             emotion for emotion in self.emotion_history
             if emotion['timestamp'] >= cutoff_time
         ]
-        
+        logger.info(f"[EmotionState] get_emotion_trajectory returned {len(trajectory)} items.")
+        logger.info(f"[EmotionState] get_emotion_trajectory returning {len(trajectory)} items")
         return trajectory
     
     def get_emotion_statistics(self, time_window: float = 60.0) -> Dict:

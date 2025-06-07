@@ -45,7 +45,7 @@ def create_app(db):
         }
         session_cfg = SessionConfig(**filtered_session_cfg)
         
-        session_manager = SessionManager(config=session_cfg, db=db)
+        session_manager = SessionManager(config=session_cfg, db=db, app=app, socketio=socketio)
         logger.info("[create_app] STEP 5: SessionManager initialized")
         logger.info("EmoTune system initialized successfully")
     except Exception as e:
@@ -151,6 +151,10 @@ def create_app(db):
             logger.error(f"Failed to submit feedback: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # --- SESSION UUID TO SOCKETIO SID MAPPING ---
+    session_uuid_to_sid = {}
+    sid_to_session_uuid = {}
+
     @socketio.on('connect')
     def on_connect():
         logger.info(f"[SocketIO] Client connected: {request.sid}")
@@ -159,12 +163,26 @@ def create_app(db):
     @socketio.on('disconnect')
     def on_disconnect():
         logger.info(f"[SocketIO] Client disconnected: {request.sid}")
+        # Remove from mapping if present
+        uuid_to_remove = None
+        for uuid, sid in session_uuid_to_sid.items():
+            if sid == request.sid:
+                uuid_to_remove = uuid
+                break
+        if uuid_to_remove:
+            del session_uuid_to_sid[uuid_to_remove]
+            del sid_to_session_uuid[request.sid]
 
     @socketio.on('start_emotion_monitoring')
     def on_start_monitoring():
         logger.info("[SocketIO] Emotion monitoring requested")
         sid = session.get('session_id')
         if sid:
+            # Map session UUID to SocketIO sid
+            session_uuid_to_sid[sid] = request.sid
+            sid_to_session_uuid[request.sid] = sid
+            # Set the real SocketIO sid in SessionManager for backend emits
+            session_manager.set_socketio_sid(request.sid)
             session_manager.start_emotion_monitoring(sid)
             emit('monitoring_started', {'message': 'Monitoring started'})
         else:
@@ -172,31 +190,57 @@ def create_app(db):
 
     @socketio.on('emotion_data')
     def on_emotion_data(data):
-        logger.info("[SocketIO] Emotion data received")
+        logger.info("[SocketIO] Emotion data received: %s", data)
         try:
-            sid = session.get('session_id')
+            # --- PATCH: Extract session_uuid from payload and set sid mapping ---
+            session_uuid = data.get('session_uuid') if isinstance(data, dict) else None
+            if session_uuid:
+                session_uuid_to_sid[session_uuid] = request.sid
+                sid_to_session_uuid[request.sid] = session_uuid
+                session_manager.set_socketio_sid(request.sid)
+                sid = session_uuid
+            else:
+                sid = session.get('session_id')
+            logger.info(f"[SocketIO] Processing emotion data for session: {sid}")
             res = session_manager.process_emotion_data(sid, data)
+            logger.info(f"[SocketIO] process_emotion_data result: {res}")
             # Get trajectory progress for visualization
             info = session_manager.trajectory_planner.get_trajectory_info()
+            logger.info(f"[SocketIO] Trajectory info: {info}")
             actual_path = data_persistence.get_emotion_history(sid)
+            logger.info(f"[SocketIO] Actual emotion path: {actual_path}")
             actual_points = [
                 {'valence': p['mean']['valence'], 'arousal': p['mean']['arousal'], 'timestamp': p['timestamp']}
                 for p in actual_path
             ] if actual_path else []
             if actual_points and info['target']:
+                logger.info(f"[SocketIO] Actual points and target present. Generating target points.")
                 target_fn = session_manager.trajectory_planner.current_trajectory
                 start_time = session_manager.trajectory_planner.start_time
-                target_points = [
-                    {'valence': target_fn(p['timestamp'] - start_time)[0],
-                     'arousal': target_fn(p['timestamp'] - start_time)[1],
-                     'timestamp': p['timestamp']}
-                    for p in actual_points
-                ]
+                target_points = []
+                for p in actual_points:
+                    try:
+                        result = target_fn(p['timestamp'] - start_time)
+                        logger.info(f"[SocketIO] target_fn({p['timestamp'] - start_time}) returned: {result} (type: {type(result)})")
+                        if isinstance(result, (list, tuple)) and len(result) >= 2:
+                            valence, arousal = result[0], result[1]
+                        else:
+                            logger.error(f"[SocketIO] target_fn did not return a tuple/list: {result}")
+                            valence, arousal = None, None
+                        target_points.append({'valence': valence, 'arousal': arousal, 'timestamp': p['timestamp']})
+                    except Exception as e:
+                        logger.error(f"[SocketIO] Error calling target_fn: {e}")
+                        target_points.append({'valence': None, 'arousal': None, 'timestamp': p['timestamp']})
             else:
+                logger.info(f"[SocketIO] Actual points or target missing. No target points generated.")
                 target_points = []
             deviation = info.get('deviation', None)
-            # Emit emotion update with target and deviation
-            emit('emotion_update', {
+            logger.info(f"[SocketIO] Deviation: {deviation}")
+            logger.info(f"[SocketIO] Emitting emotion_update event with music_parameters: {res.get('music_parameters')}")
+            # Use the real SocketIO sid for emits
+            socketio_sid = session_uuid_to_sid.get(sid, request.sid)
+            # Emit a single event with all relevant data
+            socketio.emit('emotion_update', {
                 'emotion_state': res['emotion_state'],
                 'trajectory_progress': {
                     'info': info,
@@ -206,16 +250,7 @@ def create_app(db):
                 },
                 'music_parameters': res['music_parameters'],
                 'timestamp': datetime.now().isoformat()
-            })
-            # Emit trajectory progress separately for live updates
-            emit('trajectory_progress', {
-                'info': info,
-                'actual_path': actual_points,
-                'target_path': target_points,
-                'deviation': deviation
-            })
-            # Emit music parameters for live updates
-            emit('music_parameters', res['music_parameters'])
+            }, room=socketio_sid)
         except Exception as e:
             logger.error(f"Error processing emotion data: {e}")
             emit('error', {'message': 'Processing failed'})
@@ -339,6 +374,13 @@ def create_app(db):
             return
         info = session_manager.trajectory_planner.get_trajectory_info()
         emit('trajectory_info', info)
+
+    @socketio.on('session_ready')
+    def handle_session_ready(data):
+        sid = session.get('session_id')
+        logger.info(f"[SocketIO] session_ready received for session: {sid}")
+        # Optionally, set a ready flag or perform any setup
+        emit('session_ready_ack', {'session_id': sid})
 
     @app.errorhandler(404)
     def not_found(e):

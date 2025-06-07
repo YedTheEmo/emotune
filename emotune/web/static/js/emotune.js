@@ -215,7 +215,13 @@ class EmoTuneClient {
     startEmotionMonitoring() {
         if (!this.currentSession) return;
         this.socket.emit('start_emotion_monitoring');
-        // No need to start captureEmotionData interval; backend handles all capture and emission.
+        // Emit emotion_data every second to trigger backend mapping pipeline
+        if (this.emotionDataInterval) clearInterval(this.emotionDataInterval);
+        this.emotionDataInterval = setInterval(() => {
+            // --- PATCH: include session UUID in payload ---
+            const payload = { session_uuid: this.currentSession.id };
+            this.socket.emit('emotion_data', payload);
+        }, 1000);
         // Only update session progress bar locally.
         this.progressInterval = setInterval(() => {
             this.updateSessionProgress();
@@ -223,10 +229,19 @@ class EmoTuneClient {
     }
 
     handleEmotionUpdate(data) {
+        console.log('[EmoTune] handleEmotionUpdate called:', data);
+        // --- ADDED: Confirm receipt of emotion_update from backend ---
+        if (data && data.emotion_state) {
+            console.info('[EmoTune] Received emotion_update from backend:', data.emotion_state);
+        }
         // Update emotion display
-        if (data.emotion_state) this.updateEmotionDisplay(data.emotion_state);
+        if (data.emotion_state) {
+            console.log('[EmoTune] Updating emotion display:', data.emotion_state);
+            this.updateEmotionDisplay(data.emotion_state);
+        }
         // Update trajectory visualization and info
         if (data.trajectory_progress) {
+            console.log('[EmoTune] Updating trajectory visualization:', data.trajectory_progress);
             this.updateTrajectoryVisualization(data.trajectory_progress);
             // Robustly update target and deviation fields
             let info = data.trajectory_progress.info || {};
@@ -244,9 +259,13 @@ class EmoTuneClient {
             }
         }
         // Update music parameters display
-        if (data.music_parameters) this.updateMusicParameters(data.music_parameters);
+        if (data.music_parameters) {
+            console.log('[EmoTune] Updating music parameters:', data.music_parameters);
+            this.updateMusicParameters(data.music_parameters);
+        }
         // RL/adaptation/feedback status display
         if (data.rl_status) {
+            console.log('[EmoTune] RL status:', data.rl_status);
             const rlDiv = document.getElementById('rlStatus');
             if (rlDiv) {
                 let html = '';
@@ -367,6 +386,7 @@ class EmoTuneClient {
     }
     
     updateMusicParameters(musicParams) {
+        console.log('[EmoTune] updateMusicParameters called:', musicParams);
         if (!musicParams) return;
         // Update tempo
         if (musicParams.tempo !== undefined) {

@@ -70,9 +70,16 @@ class GlobalState:
                 return obj
 
         if self.current_emotion is not None:
-            logger.info(f"[to_dict] current_emotion type: {type(self.current_emotion)}")
+            logger.debug(f"[to_dict] current_emotion type: {type(self.current_emotion)}")
+            logger.log_emotion(
+                valence=float(self.current_emotion[0]) if hasattr(self.current_emotion, '__getitem__') else 0,
+                arousal=float(self.current_emotion[1]) if hasattr(self.current_emotion, '__getitem__') else 0,
+                confidence=self.current_emotion_confidence,
+                source='state',
+                raw_data={'current_emotion': safe_tolist(self.current_emotion)}
+            )
         if self.target_emotion is not None:
-            logger.info(f"[to_dict] target_emotion type: {type(self.target_emotion)}")
+            logger.debug(f"[to_dict] target_emotion type: {type(self.target_emotion)}")
 
         return {
             'session_active': self.session_active,

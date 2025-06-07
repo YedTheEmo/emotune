@@ -40,7 +40,7 @@ class AdaptivePlanner(TrajectoryPlanner):
         if not evaluation['needs_adaptation']:
             return False
             
-        logger.info(f"Adapting trajectory due to deviation: {evaluation['deviation']:.3f}")
+        logger.debug(f"Adapting trajectory due to deviation: {evaluation['deviation']:.3f}")
         
         # Store adaptation attempt
         self.adaptation_history.append({
@@ -93,7 +93,7 @@ class AdaptivePlanner(TrajectoryPlanner):
             )
             
             if success:
-                logger.info(f"Adapted from {self.current_type.value} to {new_type.value}")
+                logger.debug(f"Adapted from {self.current_type.value} to {new_type.value}")
                 
             return success
             
@@ -180,11 +180,11 @@ class AdaptivePlanner(TrajectoryPlanner):
                 self.current_trajectory = self.library.get_trajectory(
                     self.current_type, self.duration, self.get_current_state(), self.target_state
                 )
-                logger.info(f"Adjusted trajectory target to {new_target}")
+                logger.debug(f"Adjusted trajectory target to {new_target}")
             # Optionally extend duration if behind schedule
             time_extension = min(120.0, self.duration * 0.3)  # Max 30% extension
             self.duration += time_extension
-            logger.info(f"Extended trajectory duration by {time_extension}s")
+            logger.debug(f"Extended trajectory duration by {time_extension}s")
             return True
         except Exception as e:
             logger.error(f"Parameter adjustment failed: {e}")
@@ -223,7 +223,7 @@ class AdaptivePlanner(TrajectoryPlanner):
             self.current_trajectory = self.library.get_trajectory(
                 self.current_type, self.duration, self.get_current_state(), self.target_state
             )
-            logger.info(f"RL action applied: nudged target to {self.target_state}")
+            logger.debug(f"RL action applied: nudged target to {self.target_state}")
 
     def compute_rl_reward(self, dtw_deviation: float, feedback: float, delta_p: dict, alpha=1.0, beta=0.5, gamma=0.1) -> float:
         """Compute RL reward: r_t = -α δ_t + β fb,t − γ∥Δp∥²"""

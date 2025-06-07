@@ -34,7 +34,7 @@ class EmotionCapture:
         with self._start_lock:
             logger.info(f"[EmotionCapture] start_capture called. running={self.running}, capture_thread={self.capture_thread}")
             if self.running:
-                logger.info("[EmotionCapture] start_capture called but already running.")
+                logger.debug("[EmotionCapture] start_capture called but already running.")
                 return
             try:
                 self.running = True
@@ -55,7 +55,7 @@ class EmotionCapture:
             self.running = False
             if self.capture_thread:
                 self.capture_thread.join(timeout=3.0)
-                logger.info("[EmotionCapture] capture_thread joined.")
+                logger.debug("[EmotionCapture] capture_thread joined.")
             self.capture_thread = None
             logger.info("Emotion capture stopped")
 
@@ -74,7 +74,7 @@ class EmotionCapture:
         try:
             # Wait up to 0.25s for new data (matches 5Hz emission rate)
             data = self.data_queue.get(timeout=0.25)
-            logger.info(f"[EmotionCapture] get_latest_data returned data with keys: {list(data.keys())}")
+            logger.debug(f"[EmotionCapture] get_latest_data returned data with keys: {list(data.keys())}")
             return data
         except queue.Empty:
             # Only log at debug level to reduce log noise
@@ -94,31 +94,31 @@ class EmotionCapture:
         # Proper warmup: 5 frames, 0.1s each
         for i in range(5):
             ret, warmup_frame = cap.read()
-            logger.info(f"[EmotionCapture] Warmup read {i+1}/5: ret={ret}, mean={np.mean(warmup_frame) if ret and warmup_frame is not None else 'N/A'}")
+            logger.debug(f"[EmotionCapture] Warmup read {i+1}/5: ret={ret}, mean={np.mean(warmup_frame) if ret and warmup_frame is not None else 'N/A'}")
             time.sleep(0.1)
         logger.info("[EmotionCapture] Warmup complete. Entering main loop.")
         while self.running:
             now = time.time()
             if now - last_snapshot_time >= snapshot_interval:
                 ret, frame = cap.read()
-                logger.info(f"[EmotionCapture] Frame read: ret={ret}, type={type(frame)}, shape={getattr(frame, 'shape', None)}")
+                logger.debug(f"[EmotionCapture] Frame read: ret={ret}, type={type(frame)}, shape={getattr(frame, 'shape', None)}")
                 if not ret or frame is None:
-                    logger.error("[EmotionCapture] Invalid frame captured (ret=False or None)")
+                    logger.warning("[EmotionCapture] Invalid frame captured (ret=False or None)")
                     continue
                 if not isinstance(frame, np.ndarray):
-                    logger.error(f"[EmotionCapture] Invalid frame type: {type(frame)}. Skipping frame.")
+                    logger.warning(f"[EmotionCapture] Invalid frame type: {type(frame)}. Skipping frame.")
                     continue
                 if frame.ndim != 3 or frame.shape[2] != 3:
-                    logger.error(f"[EmotionCapture] Unexpected frame shape: {getattr(frame, 'shape', None)}. Skipping frame.")
+                    logger.warning(f"[EmotionCapture] Unexpected frame shape: {getattr(frame, 'shape', None)}. Skipping frame.")
                     continue
                 frame_mean = np.mean(frame)
-                logger.info(f"[EmotionCapture] Frame mean: {frame_mean}")
+                logger.debug(f"[EmotionCapture] Frame mean: {frame_mean}")
                 if frame_mean < 5:  # Lower threshold
-                    logger.error(f"[EmotionCapture] Black frame detected! Mean: {frame_mean}")
+                    logger.warning(f"[EmotionCapture] Black frame detected! Mean: {frame_mean}")
                     continue
                 # Convert BGR to RGB for model compatibility
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                logger.info(f"[EmotionCapture] Frame converted from BGR to RGB.")
+                logger.debug(f"[EmotionCapture] Frame converted from BGR to RGB.")
                 # --- Save debug image in BGR for visual inspection (matches test script) ---
                 try:
                     debug_dir = os.path.join(os.path.dirname(__file__), '../../../face_debug')
@@ -126,17 +126,16 @@ class EmotionCapture:
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
                     debug_path = os.path.join(debug_dir, f'frame_{ts}.jpg')
                     cv2.imwrite(debug_path, frame)  # Save original BGR frame
-                    logger.info(f"[EmotionCapture] Debug frame saved: {debug_path}")
+                    logger.debug(f"[EmotionCapture] Debug frame saved: {debug_path}")
                 except Exception as e:
                     logger.error(f"[EmotionCapture] Failed to save debug frame: {e}")
-                # --- End debug image save ---
-                logger.info(f"[EmotionCapture] Frame valid, preparing data for queue.")
+                logger.debug(f"[EmotionCapture] Frame valid, preparing data for queue.")
                 # Real audio capture: 0.5s chunk
                 try:
                     audio_data = sd.rec(int(0.5 * self.sample_rate), samplerate=self.sample_rate, channels=1, dtype='float32')
                     sd.wait()
                     audio_data = audio_data.flatten()
-                    logger.info(f"[EmotionCapture] Audio captured: shape={audio_data.shape}, dtype={audio_data.dtype}")
+                    logger.debug(f"[EmotionCapture] Audio captured: shape={audio_data.shape}, dtype={audio_data.dtype}")
                 except Exception as e:
                     logger.error(f"[EmotionCapture] Audio capture failed: {e}. Using zeros.")
                     audio_data = np.zeros(int(0.5 * self.sample_rate), dtype=np.float32)
@@ -148,15 +147,22 @@ class EmotionCapture:
                 }
                 try:
                     self.data_queue.put_nowait(data)
-                    logger.info(f"[EmotionCapture] Data put in queue. Keys: {list(data.keys())}")
+                    logger.debug(f"[EmotionCapture] Data put in queue. Keys: {list(data.keys())}")
                 except queue.Full:
                     logger.warning("[EmotionCapture] Data queue full, dropping oldest.")
                     try:
                         self.data_queue.get_nowait()
                         self.data_queue.put_nowait(data)
-                        logger.info("[EmotionCapture] Oldest data dropped, new data put in queue.")
+                        logger.debug("[EmotionCapture] Oldest data dropped, new data put in queue.")
                     except queue.Empty:
                         logger.error("[EmotionCapture] Data queue full and empty on get_nowait().")
+                logger.log_emotion(
+                    valence=np.mean(frame_rgb) if frame_rgb is not None else 0,
+                    arousal=0,  # Placeholder, real arousal should be computed if available
+                    confidence=1.0 if frame_rgb is not None else 0.0,
+                    source='face',
+                    raw_data={'frame_shape': frame_rgb.shape if frame_rgb is not None else None}
+                )
                 last_snapshot_time = now
             time.sleep(0.01)
         logger.info("[EmotionCapture] Exiting _capture_loop, releasing camera.")

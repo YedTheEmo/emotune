@@ -24,18 +24,18 @@ class EmotionFusion:
 
         # Log incoming face and voice emotion data
         if face_data:
-            logger.info(f"Face emotion detected: Valence={face_data['emotions']['valence']:.3f}, "
+            logger.debug(f"Face emotion detected: Valence={face_data['emotions']['valence']:.3f}, "
                         f"Arousal={face_data['emotions']['arousal']:.3f}, "
                         f"Confidence={face_data['confidence']:.3f}")
         else:
-            logger.info("No face data provided.")
+            logger.debug("No face data provided.")
 
         if voice_data:
-            logger.info(f"Voice emotion detected: Valence={voice_data['emotions']['valence']:.3f}, "
+            logger.debug(f"Voice emotion detected: Valence={voice_data['emotions']['valence']:.3f}, "
                         f"Arousal={voice_data['emotions']['arousal']:.3f}, "
                         f"Confidence={voice_data['confidence']:.3f}")
         else:
-            logger.info("No voice data provided.")
+            logger.debug("No voice data provided.")
 
         # Extract emotions and confidences
         emotions = []
@@ -65,7 +65,7 @@ class EmotionFusion:
 
         # Weighted fusion
         fused_valence = sum(w * e['valence'] for w, e in zip(weights, emotions))
-        logger.info("DEBUG unpacking at line: fused_arousal = sum(w * e['arousal'] for w, e in zip(weights, emotions))")
+        logger.debug("DEBUG unpacking at line: fused_arousal = sum(w * e['arousal'] for w, e in zip(weights, emotions))")
         fused_arousal = sum(w * e['arousal'] for w, e in zip(weights, emotions))
 
         # Calculate uncertainty (inverse of total confidence)
@@ -104,6 +104,14 @@ class EmotionFusion:
                     f"Arousal={fused_result['arousal']:.3f}, "
                     f"Uncertainty={fused_result['uncertainty']:.3f}, "
                     f"Confidence={fused_result['confidence']:.3f}")
+
+        logger.log_emotion(
+            valence=fused_valence,
+            arousal=fused_arousal,
+            confidence=float(total_confidence),
+            source='fusion',
+            raw_data={'face': face_data, 'voice': voice_data}
+        )
 
         return fused_result
 

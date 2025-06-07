@@ -136,10 +136,42 @@ class SessionManager:
         # Fetch the latest status
         status = self.get_current_status()
 
+        # --- FLATTEN EMOTION STATE FOR FRONTEND ---
+        current_emotion = status.get('current_emotion')
+        if current_emotion and 'mean' in current_emotion:
+            flat_emotion = {
+                'valence': current_emotion['mean'].get('valence', 0),
+                'arousal': current_emotion['mean'].get('arousal', 0),
+                'confidence': 1 - min(1, current_emotion.get('uncertainty_trace', 0.5)/2)
+            }
+        else:
+            flat_emotion = {'valence': 0, 'arousal': 0, 'confidence': 0}
+
+        logger.log_emotion(
+            valence=flat_emotion['valence'],
+            arousal=flat_emotion['arousal'],
+            confidence=flat_emotion['confidence'],
+            source='fused',
+            raw_data=current_emotion
+        )
+
+        # --- BUILD TRAJECTORY PROGRESS FOR FRONTEND ---
+        # This logic assumes you have access to trajectory info and actual/target paths
+        # If not, you may need to adjust this to match your actual data pipeline
+        trajectory_progress = status.get('trajectory_progress')
+        if not trajectory_progress:
+            # Fallback: build minimal structure
+            trajectory_progress = {
+                'info': {},
+                'actual_path': [],
+                'target_path': [],
+                'deviation': None
+            }
+
         return {
-            'emotion_state': status.get('emotion_state'),
-            'trajectory_progress': status.get('trajectory_progress'),
-            'music_parameters': status.get('music_parameters'),
+            'emotion_state': flat_emotion,
+            'trajectory_progress': trajectory_progress,
+            'music_parameters': status.get('music_parameters', {})
         }
 
     def start_emotion_monitoring(self, session_id: str):
@@ -259,31 +291,19 @@ class SessionManager:
                 analyze_kwargs = {k: v for k, v in transformed_data.items() if k in allowed}
 
                 if analyze_kwargs:
-                    logger.info(f"[SessionManager] Passing data to emotion_analyzer.analyze: {list(analyze_kwargs.keys())}")
-                    # Analyze emotions
                     analysis_result = self.emotion_analyzer.analyze(**analyze_kwargs)
-                    logger.info(f"[SessionManager] emotion_analyzer.analyze result: {analysis_result}")
-                    
-                    # Fuse the emotion data
-                    logger.info("[SessionManager] Passing analysis_result to _fuse_emotion_data...")
+                    logger.debug(f"[SessionManager] emotion_analyzer.analyze result: {analysis_result}")
                     fused_emotion = self._fuse_emotion_data(analysis_result)
-                    logger.info(f"[SessionManager] _fuse_emotion_data result: {fused_emotion}")
-                    
-                    if fused_emotion is not None:
-                        with self.emotion_data_lock:
-                            self.latest_emotion_data = fused_emotion
-                        try:
-                            self.emotion_data_queue.put_nowait(fused_emotion)
-                            logger.info("[SessionManager] Fused emotion data put into emotion_data_queue.")
-                        except queue.Full:
-                            try:
-                                self.emotion_data_queue.get_nowait()
-                                self.emotion_data_queue.put_nowait(fused_emotion)
-                                logger.warning("[SessionManager] emotion_data_queue was full, dropped oldest and added new fused_emotion.")
-                            except queue.Empty:
-                                logger.error("[SessionManager] emotion_data_queue full and empty on get_nowait().")
+                    logger.log_emotion(
+                        valence=fused_emotion.get('valence', 0) if fused_emotion else 0,
+                        arousal=fused_emotion.get('arousal', 0) if fused_emotion else 0,
+                        confidence=fused_emotion.get('uncertainty', 0.5) if fused_emotion else 0.5,
+                        source='fused',
+                        raw_data=fused_emotion
+                    )
+                    # ...existing code...
                 else:
-                    logger.info("[SessionManager] No valid data to pass to emotion_analyzer.analyze.")
+                    logger.debug("[SessionManager] No valid data to pass to emotion_analyzer.analyze.")
 
                 self.shutdown_event.wait(0.05)  # Use event wait for interruptible sleep
             except Exception as e:
@@ -291,7 +311,7 @@ class SessionManager:
                 self.shutdown_event.wait(0.1)
 
     def _fuse_emotion_data(self, analysis_result: Dict) -> Optional[Dict]:
-        logger.info(f"[SessionManager] _fuse_emotion_data called with: {analysis_result}")
+        logger.debug(f"[SessionManager] _fuse_emotion_data called with: {analysis_result}")
         try:
             face_data = analysis_result.get('face')
             voice_data = analysis_result.get('voice')
@@ -306,9 +326,9 @@ class SessionManager:
                     },
                     'confidence': face_data['confidence']
                 }
-                logger.info(f"[SessionManager] Valid face_data for fusion: {face_dict}")
+                logger.debug(f"[SessionManager] Valid face_data for fusion: {face_dict}")
             else:
-                logger.info("[SessionManager] No valid face_data for fusion.")
+                logger.debug("[SessionManager] No valid face_data for fusion.")
 
             # Build voice dict if valid
             voice_dict = None
@@ -320,17 +340,17 @@ class SessionManager:
                     },
                     'confidence': voice_data['confidence']
                 }
-                logger.info(f"[SessionManager] Valid voice_data for fusion: {voice_dict}")
+                logger.debug(f"[SessionManager] Valid voice_data for fusion: {voice_dict}")
             else:
-                logger.info("[SessionManager] No valid voice_data for fusion.")
+                logger.debug("[SessionManager] No valid voice_data for fusion.")
 
             # Call fuse_emotions with the correct dict parameters
-            logger.info(f"[SessionManager] Calling emotion_fusion.fuse_emotions(face_data={face_dict}, voice_data={voice_dict})")
+            logger.debug(f"[SessionManager] Calling emotion_fusion.fuse_emotions(face_data={face_dict}, voice_data={voice_dict})")
             fused_emotion = self.emotion_fusion.fuse_emotions(
                 face_data=face_dict,
                 voice_data=voice_dict
             )
-            logger.info(f"[SessionManager] emotion_fusion.fuse_emotions result: {fused_emotion}")
+            logger.debug(f"[SessionManager] emotion_fusion.fuse_emotions result: {fused_emotion}")
             return fused_emotion
 
         except Exception as e:
@@ -342,7 +362,7 @@ class SessionManager:
         logger.info(f"[SessionManager] _process_emotion_update called at session_time={session_time}")
         try:
             fused_emotion = self._get_current_emotion()  # now returns full dict with mean + covariance
-            logger.info(f"[SessionManager] _get_current_emotion returned: {fused_emotion}")
+            logger.debug(f"[SessionManager] _get_current_emotion returned: {fused_emotion}")
 
             if fused_emotion is not None:
                 # Kalman expects valence/arousal, not mean/covariance
@@ -373,6 +393,11 @@ class SessionManager:
                 logger.info(f"[SessionManager] Mapped music parameters: {mapped_params}")
                 from emotune.utils.logging import log_music
                 log_music(mapped_params, trajectory_type=getattr(self, 'current_trajectory_type', None), trajectory_progress=session_time/self.config.session_duration)
+                logger.log_music_generation(
+                    parameters=mapped_params,
+                    trajectory_type=getattr(self, 'current_trajectory_type', None),
+                    trajectory_progress=session_time/self.config.session_duration
+                )
                 self.music_renderer.update_target_parameters(mapped_params)
                 self.music_renderer.current_params = mapped_params.copy()  # Immediate update for frontend
 
@@ -388,11 +413,11 @@ class SessionManager:
                 logger.info(f"[SessionManager] Target emotion: {target_emotion}, Deviation: {deviation}")
 
                 if self.rl_agent:
-                    logger.info("[SessionManager] Storing RL state...")
+                    logger.debug("[SessionManager] Storing RL state...")
                     self._store_rl_state(filtered_emotion, deviation, session_time)
 
                 if self.on_emotion_update:
-                    logger.info("[SessionManager] Calling on_emotion_update callback...")
+                    logger.debug("[SessionManager] Calling on_emotion_update callback...")
                     self.on_emotion_update({
                         'emotion': filtered_emotion,
                         'target': target_emotion,
@@ -411,176 +436,79 @@ class SessionManager:
             # Try to get emotion from queue first (most recent)
             try:
                 emotion_data = self.emotion_data_queue.get_nowait()
-                logger.info(f"[SessionManager] _get_current_emotion got from queue: {emotion_data}")
+                logger.debug(f"[SessionManager] _get_current_emotion got from queue: {emotion_data}")
                 return emotion_data
             except queue.Empty:
-                logger.info("[SessionManager] _get_current_emotion: emotion_data_queue empty.")
+                logger.debug("[SessionManager] _get_current_emotion: emotion_data_queue empty.")
                 pass
 
             # Fall back to latest emotion data
             with self.emotion_data_lock:
                 if self.latest_emotion_data is not None:
-                    logger.info(f"[SessionManager] _get_current_emotion using latest_emotion_data: {self.latest_emotion_data}")
+                    logger.debug(f"[SessionManager] _get_current_emotion using latest_emotion_data: {self.latest_emotion_data}")
                     return self.latest_emotion_data.copy()
 
             # No emotion data available
-            logger.info("[SessionManager] _get_current_emotion: No emotion data available.")
+            logger.debug("[SessionManager] _get_current_emotion: No emotion data available.")
             return None
 
         except Exception as e:
             logger.error(f"Error getting current emotion: {e}")
             return None
 
-    def _get_rl_state(self, session_time: float) -> np.ndarray:
-        """Get current state vector for RL agent"""
-        current_emotion = self.emotion_state.get_current_emotion()
-        emotion_cov = current_emotion.get('covariance') if current_emotion else None
-
-        # Get trajectory progress
-        progress = session_time / self.config.session_duration
-
-        # Get DTW deviation
-        target = self.trajectory_planner.get_current_target()
-        recent_trajectory = self.emotion_state.get_emotion_trajectory()
+    def _get_trajectory_progress(self, session_time=None):
+        """Return a robust, always-present trajectory progress structure for frontend visualization."""
+        if session_time is None:
+            session_time = time.time() - self.session_start_time if self.running else 0
+        # Get actual path: list of (timestamp, valence, arousal)
+        actual_traj = self.emotion_state.get_emotion_trajectory() or []
+        # Get target path: list of (timestamp, valence, arousal)
+        target_traj = self.trajectory_planner.current_trajectory if hasattr(self.trajectory_planner, 'current_trajectory') else []
+        # Defensive: align lengths and timestamps if possible
+        def to_path(traj):
+            # Accepts list of dicts or tuples
+            path = []
+            for pt in traj:
+                if isinstance(pt, dict):
+                    t = pt.get('timestamp', None)
+                    v = pt.get('valence', pt.get('mean', {}).get('valence', None))
+                    a = pt.get('arousal', pt.get('mean', {}).get('arousal', None))
+                elif isinstance(pt, (tuple, list)) and len(pt) >= 3:
+                    t, v, a = pt[:3]
+                else:
+                    continue
+                if t is not None and v is not None and a is not None:
+                    path.append((t, v, a))
+            return path
+        actual_path = to_path(actual_traj)
+        target_path = to_path(target_traj)
+        # Current target
+        current_target = self.trajectory_planner.get_current_target() if self.running else None
+        # Deviation
         deviation = self.dtw_matcher.compute_trajectory_deviation(
-            recent_trajectory,
-            self.trajectory_planner.current_trajectory,
-            self.trajectory_planner.start_time
+            actual_traj, target_traj, self.trajectory_planner.start_time if hasattr(self.trajectory_planner, 'start_time') else 0
         )
-
-        if current_emotion:
-            emotion_mean = np.array([
-                current_emotion['mean']['valence'],
-                current_emotion['mean']['arousal']
-            ])
-        else:
-            # fallback zero vector if no emotion
-            emotion_mean = np.array([0.0, 0.0])
-
-        return self.rl_agent.get_state_vector(
-            emotion_mean, emotion_cov, deviation, progress
-        )
-
-    def _store_rl_state(self, emotion: np.ndarray, deviation: float, session_time: float):
-        """Store state for RL training"""
-        if not self.rl_agent:
-            return
-
-        try:
-            # Create state-action-reward tuple for RL training
-            current_state = self._get_rl_state(session_time)
-            
-            # Store the experience in RL agent's memory
-            # This would typically include: state, action, reward, next_state, done
-            self.rl_agent.store_experience(
-                state=current_state,
-                emotion=emotion,
-                deviation=deviation,
-                session_time=session_time
-            )
-            
-        except Exception as e:
-            logger.error(f"Error storing RL state: {e}")
-
-    def _process_rl_training(self, session_time: float):
-        """Process RL training updates using explicit/implicit feedback for reward."""
-        if not self.config.enable_feedback or not self.rl_agent:
-            return
-
-        try:
-            # Get reward signal using only explicit/implicit feedback
-            trajectory_deviation = self.dtw_matcher.compute_trajectory_deviation(
-                self.emotion_state.get_emotion_trajectory(),
-                self.trajectory_planner.current_trajectory,
-                self.trajectory_planner.start_time
-            )
-            emotion_stability = self.emotion_state.get_stability_metric()
-            reward = self.feedback_processor.compute_reward_signal(
-                trajectory_deviation, emotion_stability
-            )
-
-            # Store the experience in RL agent's memory
-            self.rl_agent.store_experience(
-                state=self._get_rl_state(session_time),
-                emotion=self.emotion_state.get_current_emotion(),
-                deviation=trajectory_deviation,
-                session_time=session_time
-            )
-
-            # Train RL agent periodically
-            if int(session_time) % 30 == 0:  # Every 30 seconds
-                logger.info("Training RL agent...")
-                self.rl_agent.train()
-
-        except Exception as e:
-            logger.error(f"Error in RL training: {e}")
-
-    def _generate_session_summary(self) -> Dict:
-        """Generate summary of completed session"""
-        session_duration = time.time() - self.session_start_time
-
-        summary = {
-            'session_duration': session_duration,
-            'trajectory_name': self.config.trajectory_name,
-            'emotion_updates': self.emotion_state.get_update_count(),
-            'final_emotion': self.emotion_state.get_current_emotion(),
-            'trajectory_adherence': self.trajectory_planner.evaluate_trajectory_adherence(),
-            'emotion_analysis_enabled': {
-                'face': self.config.enable_face_analysis,
-                'voice': self.config.enable_voice_analysis
-            }
-        }
-
-        if self.config.enable_feedback:
-            feedback_summary = self.feedback_collector.get_session_feedback_summary()
-            summary['feedback'] = feedback_summary
-
-        if self.rl_agent:
-            rl_summary = self.rl_agent.get_training_summary()
-            summary['rl_training'] = rl_summary
-
-        return summary
-
-    # Public interface methods
-    def submit_feedback(self, rating: float, context: str = ""):
-        """Submit explicit user feedback"""
-        if self.config.enable_feedback:
-            self.feedback_collector.collect_explicit_feedback(rating, context)
-
-    def log_interaction(self, interaction_type: str, intensity: float = 1.0):
-        """Log user interaction for implicit feedback"""
-        if self.config.enable_feedback:
-            self.feedback_collector.collect_implicit_feedback(interaction_type, intensity)
-
- 
- 
-    def get_emotion_analysis_status(self) -> Dict:
-        """Get detailed emotion analysis status"""
-        camera_status = False
-        try:
-            # Try to check camera status if possible
-            cap = cv2.VideoCapture(self.config.camera_index, cv2.CAP_DSHOW)
-            camera_status = cap.isOpened()
-            cap.release()
-        except Exception:
-            camera_status = False
+        # Progress
+        progress = session_time / self.config.session_duration if self.running and self.config.session_duration else 0
         return {
-            'analyzers_loaded': {
-                'face': hasattr(self.emotion_analyzer, 'face_analyzer'),
-                'voice': hasattr(self.emotion_analyzer, 'voice_analyzer')
-            },
-            'capture_config': {
-                'face_enabled': self.config.enable_face_analysis,
-                'voice_enabled': self.config.enable_voice_analysis,
-                'camera_index': self.config.camera_index,
-                'audio_device_index': self.config.audio_device_index
-            },
-            'processing_stats': {
-                'emotion_queue_size': self.emotion_data_queue.qsize(),
-                'has_latest_data': self.latest_emotion_data is not None
-            },
-            'camera_status': camera_status
+            'actual_path': actual_path,
+            'target_path': target_path,
+            'current_target': current_target,
+            'deviation': deviation,
+            'session_time': session_time,
+            'progress': progress
         }
+
+    def get_rl_status(self):
+        """Return RL and adaptation status for frontend/logging/debugging."""
+        rl_status = {}
+        if self.rl_agent:
+            rl_status['training_summary'] = self.rl_agent.get_training_summary()
+        if hasattr(self, 'feedback_processor'):
+            rl_status['feedback'] = self.feedback_processor.process_feedback_for_learning()
+        if hasattr(self.trajectory_planner, 'get_adaptation_statistics'):
+            rl_status['adaptation'] = self.trajectory_planner.get_adaptation_statistics()
+        return rl_status
 
     def get_current_status(self) -> Dict:
         """Get current session status"""
@@ -600,6 +528,9 @@ class SessionManager:
             except AttributeError:
                 return obj
 
+        # --- NEW: Always include robust trajectory_progress ---
+        trajectory_progress = self._get_trajectory_progress(session_time)
+        rl_status = self.get_rl_status()
         return {
             'running': self.running,
             'session_time': session_time,
@@ -609,7 +540,9 @@ class SessionManager:
             'target_emotion': self.trajectory_planner.get_current_target() if self.running else None,
             'music_parameters': getattr(self, '_latest_music_parameters', self.music_renderer.current_params),
             'emotion_capture_running': self.emotion_capture.is_running() if hasattr(self.emotion_capture, 'is_running') else False,
-            'queue_size': self.emotion_data_queue.qsize()
+            'queue_size': self.emotion_data_queue.qsize(),
+            'trajectory_progress': trajectory_progress,
+            'rl_status': rl_status
         }
 
     def update_emotion_config(self, **kwargs):
@@ -707,5 +640,11 @@ class SessionManager:
             )
 
             logger.info(f"Feedback processed for session {session_id}: {feedback}")
+            logger.log_feedback(
+                feedback_type='explicit',
+                rating=feedback.get('rating', 0),
+                category=feedback.get('category', None),
+                context={'comments': feedback.get('comments', '')}
+            )
         except Exception as e:
             logger.error(f"Error processing feedback for session {session_id}: {e}")

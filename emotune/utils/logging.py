@@ -94,7 +94,7 @@ class EmoTuneLogger:
 
         # Main application logger
         self.logger = logging.getLogger('emotune')
-        self.logger.setLevel(log_level)
+        self.logger.setLevel(logging.DEBUG)  # Always allow all logs to handlers
 
         # Clear existing handlers
         self.logger.handlers = []
@@ -110,21 +110,23 @@ class EmoTuneLogger:
         except Exception as e:
             print(f"File handler error: {e}", file=sys.stderr)
 
-        # FIXED CONSOLE HANDLER - USE sys.stdout
-        console_handler = logging.StreamHandler(sys.stdout)
-
         # Formatter
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
-        
         if file_handler:
             file_handler.setFormatter(formatter)
+            file_handler.setLevel(logging.DEBUG)  # File gets all logs
             self.logger.addHandler(file_handler)
-        
+
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(formatter)
-        console_handler.setLevel(log_level)  # ENSURE PROPER LEVEL
+        console_handler.setLevel(logging.INFO)  # Console gets only INFO+
         self.logger.addHandler(console_handler)
+
+        # Prevent log propagation to root logger (avoids duplicate/extra output)
+        self.logger.propagate = False
 
     def _setup_structured_loggers(self):
         """Setup structured data loggers for analytics"""
@@ -553,8 +555,8 @@ class EmoTuneLogger:
         return self.logger.warning(message, *args, **kwargs)
     
     def debug(self, message, *args, **kwargs):
-        """Forward debug calls to internal logger"""
-        return self.logger.info(message, *args, **kwargs)
+        """Forward debug calls to internal logger (FIXED: now uses debug level)"""
+        return self.logger.debug(message, *args, **kwargs)
     
     def exception(self, message, *args, **kwargs):
         """Forward exception calls to internal logger"""
@@ -570,10 +572,11 @@ _logger_instance = None
 
 
 def get_logger() -> EmoTuneLogger:
-    """Get the global EmoTune logger instance"""
+    """Get the global EmoTune logger instance. Always use this in codebase, not logging.info() directly."""
     global _logger_instance
     if _logger_instance is None:
-        _logger_instance = EmoTuneLogger()
+        # Default to DEBUG for both logger and file handler
+        _logger_instance = EmoTuneLogger(log_dir="logs", log_level=logging.DEBUG)
     return _logger_instance
 
 def init_logger(log_dir: str = "logs", log_level: int = logging.INFO) -> EmoTuneLogger:
@@ -638,3 +641,6 @@ if __name__ == "__main__":
     # Export session data
     export_file = logger.export_session_data("test_session_001")
     print(f"Session data exported to: {export_file}")
+
+# NOTE: Always use get_logger() and logger.info()/debug()/error() in codebase, not logging.info() directly.
+# This ensures all logs go through the custom EmoTuneLogger and are properly structured/handled.

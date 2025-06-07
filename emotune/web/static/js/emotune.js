@@ -8,7 +8,6 @@ class EmoTuneClient {
         this.isConnected = false;
         this.currentSession = null;
         this.emotionMonitoring = false;
-        this.videoStream = null;
         this.audioContext = null;
         this.trajectoryCanvas = null;
         this.trajectoryCtx = null;
@@ -214,38 +213,13 @@ class EmoTuneClient {
     }
     
     startEmotionMonitoring() {
-        if (!this.videoStream || !this.currentSession) return;
-        
+        if (!this.currentSession) return;
         this.socket.emit('start_emotion_monitoring');
-        
-        // Start capturing emotion data
-        this.emotionCaptureInterval = setInterval(() => {
-            this.captureEmotionData();
-        }, 1000); // Capture every second
-        
-        // Update session progress
+        // No need to start captureEmotionData interval; backend handles all capture and emission.
+        // Only update session progress bar locally.
         this.progressInterval = setInterval(() => {
             this.updateSessionProgress();
         }, 1000);
-    }
-    
-    captureEmotionData() {
-        if (!this.emotionMonitoring || !this.videoStream || !this.currentSession || !this.currentSession.id) return;
-        // Capture frame from video
-        const videoElement = document.getElementById('videoElement');
-        const canvas = document.createElement('canvas');
-        canvas.width = videoElement.videoWidth;
-        canvas.height = videoElement.videoHeight;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(videoElement, 0, 0);
-        // Convert to base64 for transmission
-        const imageData = canvas.toDataURL('image/jpeg', 0.8);
-        // Emit emotion data to server (payload must match backend expectations)
-        this.socket.emit('emotion_data', {
-            image_data: imageData,
-            timestamp: Date.now(),
-            session_id: this.currentSession.id
-        });
     }
 
     handleEmotionUpdate(data) {
@@ -271,6 +245,28 @@ class EmoTuneClient {
         }
         // Update music parameters display
         if (data.music_parameters) this.updateMusicParameters(data.music_parameters);
+        // RL/adaptation/feedback status display
+        if (data.rl_status) {
+            const rlDiv = document.getElementById('rlStatus');
+            if (rlDiv) {
+                let html = '';
+                if (data.rl_status.training_summary) {
+                    html += `<b>RL Buffer:</b> ${data.rl_status.training_summary.buffer_size} <br/>`;
+                    html += `<b>Current Params:</b> ${JSON.stringify(data.rl_status.training_summary.current_params)} <br/>`;
+                }
+                if (data.rl_status.feedback) {
+                    html += `<b>Feedback Reward:</b> ${data.rl_status.feedback.reward?.toFixed(3)} <br/>`;
+                    html += `<b>Feedback Confidence:</b> ${data.rl_status.feedback.confidence?.toFixed(2)} <br/>`;
+                    html += `<b>Feedback Trend:</b> ${data.rl_status.feedback.trend?.toFixed(3)} <br/>`;
+                }
+                if (data.rl_status.adaptation) {
+                    html += `<b>Adaptations:</b> ${data.rl_status.adaptation.total_adaptations} <br/>`;
+                    html += `<b>Recent Adaptations:</b> ${data.rl_status.adaptation.recent_adaptations} <br/>`;
+                    html += `<b>Adaptation Rate:</b> ${data.rl_status.adaptation.adaptation_rate?.toFixed(3)} /min <br/>`;
+                }
+                rlDiv.innerHTML = html;
+            }
+        }
     }
 
     updateEmotionDisplay(emotionState) {

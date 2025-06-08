@@ -36,7 +36,7 @@ class TrajectoryPlanner:
                         duration: float = 300.0,
                         start_state: Dict = None,
                         target_state: Dict = None) -> bool:
-        """Start a new therapeutic trajectory"""
+        """Start a new therapeutic trajectory with validation and fallback."""
         try:
             self.current_trajectory = self.library.get_trajectory(
                 trajectory_type, duration, start_state, target_state
@@ -45,10 +45,19 @@ class TrajectoryPlanner:
             self.start_time = time.time()
             self.duration = duration
             self.status = TrajectoryStatus.ACTIVE
-            
+
+            # --- NEW: Validate trajectory and add dead-reckoning placeholder ---
+            if not callable(self.current_trajectory):
+                logger.warning("Trajectory function is not callable. Using fallback.")
+                def fallback_trajectory(t):
+                    # Dead-reckoning: hold start_state or zeros
+                    if start_state and 'valence' in start_state and 'arousal' in start_state:
+                        return (start_state['valence'], start_state['arousal'])
+                    return (0.0, 0.0)
+                self.current_trajectory = fallback_trajectory
+
             logger.info(f"Started trajectory: {trajectory_type.value} for {duration}s")
             return True
-            
         except Exception as e:
             logger.error(f"Failed to start trajectory: {e}")
             return False
@@ -65,18 +74,21 @@ class TrajectoryPlanner:
         self.status = TrajectoryStatus.INACTIVE
     
     def get_current_target(self) -> Optional[Tuple[float, float]]:
-        """Get current trajectory target point"""
+        """Get current trajectory target point, fallback to zeros if missing."""
         if not self._is_active():
-            return None
-            
+            return (0.0, 0.0)
         current_time = time.time()
         elapsed = current_time - self.start_time
-        
         if elapsed >= self.duration:
             self.status = TrajectoryStatus.COMPLETED
-            return self.current_trajectory(self.duration)
-            
-        return self.current_trajectory(elapsed)
+            try:
+                return self.current_trajectory(self.duration)
+            except Exception:
+                return (0.0, 0.0)
+        try:
+            return self.current_trajectory(elapsed)
+        except Exception:
+            return (0.0, 0.0)
     
     def evaluate_trajectory_adherence(self, emotion_trajectory: list) -> Dict:
         """Evaluate how well actual trajectory matches target"""

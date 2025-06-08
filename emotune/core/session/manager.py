@@ -26,6 +26,8 @@ from ..feedback.processor import FeedbackProcessor
 from ..music.engine_tidal import TidalEngine
 from ..music.engine_sonicpi import SonicPiEngine
 from ..music.engine_midi import MidiEngine
+from emotune.utils.naming import snake_to_camel
+from emotune.core.music.patterns import generate_tidal_pattern
 
 from emotune.utils.logging import get_logger
 logger = get_logger()
@@ -62,9 +64,10 @@ class SessionManager:
         self.capture_thread = None
 
         # Data queues for thread communication
-        self.emotion_data_queue = queue.Queue(maxsize=10)
+        self.emotion_data_queue = queue.Queue(maxsize=50)  # Increased size for robustness
         self.latest_emotion_data = None
         self.emotion_data_lock = threading.Lock()
+        self._empty_queue_counter = 0  # Track consecutive empty queue events
 
         # Callbacks
         self.on_emotion_update: Optional[Callable] = None
@@ -77,6 +80,11 @@ class SessionManager:
             audio_duration=0.5,
             sample_rate=16000
         )
+
+        # Missing data warning tracking
+        self._last_valid_emotion_time = time.time()
+        self._missing_data_warning_sent = False
+        self._missing_data_timeout = 3.0  # seconds, configurable
 
     def _init_subsystems(self):
         """Initialize all EmoTune subsystems"""
@@ -199,6 +207,10 @@ class SessionManager:
                 logger.error("Failed to start emotion capture")
                 raise RuntimeError("Emotion capture start failed")
 
+            # --- PHASE 2: Initialize Kalman filter for filtered emotion ---
+            self.kalman_filter = KalmanEmotionFilter()
+            self._latest_filtered_emotion = None
+
             self.shutdown_event.clear()  # Reset shutdown event at session start
             self.running = True
             self.session_start_time = time.time()
@@ -248,6 +260,13 @@ class SessionManager:
                 if thread.is_alive():
                     logger.warning(f"{thread_name} did not terminate after shutdown signal!")
 
+        # --- PHASE 2: Reset filter and filtered emotion on session end ---
+        self.kalman_filter = None
+        self._latest_filtered_emotion = None
+
+        # Explicitly clear emotion trajectory/history at session end
+        self.emotion_state.clear_history()
+
         # Session cleanup
         if self.on_session_end:
             session_summary = self._generate_session_summary()
@@ -267,7 +286,17 @@ class SessionManager:
                 # Get data from emotion capture (a dict with keys 'face_frame' & 'audio_chunk')
                 data = self.emotion_capture.get_data()
                 if not data:
-                    time.sleep(0.05)  # Reduce CPU usage if no data
+                    # Check for missing data timeout
+                    now = time.time()
+                    if (now - self._last_valid_emotion_time > self._missing_data_timeout and
+                        not self._missing_data_warning_sent):
+                        # Emit warning to frontend
+                        if self.app is not None and self.socketio is not None:
+                            sid = getattr(self, '_current_socketio_sid', None)
+                            if sid:
+                                self.socketio.emit('emotion_update', {'warning': f'No emotion data received for {int(now - self._last_valid_emotion_time)} seconds.'}, room=sid)
+                                self._missing_data_warning_sent = True
+                    time.sleep(0.05)
                     continue
                 logger.debug(f"[SessionManager] emotion_capture.get_data() returned: {type(data)} {list(data.keys()) if data else data}")
                 if not data:
@@ -301,6 +330,19 @@ class SessionManager:
                     logger.debug(f"[SessionManager] emotion_analyzer.analyze result: {analysis_result}")
                     fused_emotion = self._fuse_emotion_data(analysis_result)
                     logger.debug(f"[SessionManager] _fuse_emotion_data returned: {fused_emotion}")
+                    # --- FIX: Put fused emotion into the emotion_data_queue for downstream processing ---
+                    if fused_emotion:
+                        try:
+                            self.emotion_data_queue.put_nowait(fused_emotion)
+                            logger.debug("[SessionManager] Fused emotion put in emotion_data_queue.")
+                        except queue.Full:
+                            logger.warning("[SessionManager] emotion_data_queue full, dropping oldest.")
+                            try:
+                                self.emotion_data_queue.get_nowait()
+                                self.emotion_data_queue.put_nowait(fused_emotion)
+                                logger.debug("[SessionManager] Oldest emotion dropped, new fused emotion put in queue.")
+                            except queue.Empty:
+                                logger.error("[SessionManager] emotion_data_queue full and empty on get_nowait().")
                     session_time = time.time() - getattr(self, 'session_start_time', time.time())
                     # --- Call _process_emotion_update to update filtered emotion and history ---
                     self._process_emotion_update(session_time)
@@ -311,7 +353,7 @@ class SessionManager:
                         arousal=fused_emotion.get('arousal', 0) if fused_emotion else 0,
                         confidence=fused_emotion.get('uncertainty', 0.5) if fused_emotion else 0.5,
                         source='fused',
-                        raw_data=fused_emotion
+                        raw_data=fused_emotion,
                     )
                     # --- EMIT TO FRONTEND (SOCKETIO) ---
                     try:
@@ -322,53 +364,61 @@ class SessionManager:
                             if not sid:
                                 logger.error("[SessionManager] No SocketIO sid set! Cannot emit to frontend.")
                                 continue
+                            # --- PHASE 2: Use filtered emotion if available ---
                             if filtered_emotion is not None:
                                 flat_emotion = {
                                     'valence': filtered_emotion.get('valence', 0),
                                     'arousal': filtered_emotion.get('arousal', 0),
                                     'confidence': filtered_emotion.get('confidence', 0.5)
                                 }
-                                trajectory_progress = status.get('trajectory_progress', {})
-                                music_parameters = status.get('music_parameters', {})
-
-                                payload = {
-                                    'emotion_state': flat_emotion,
-                                    'trajectory_progress': trajectory_progress,
-                                    'music_parameters': music_parameters,
-                                    'timestamp': time.time()
-                                }
-
-                                # Log type and repr for every value in payload
-                                for k, v in payload.items():
-                                    logger.info(f"[EmitPayload] {k}: type={type(v)}, repr={repr(v)}")
-                                    if callable(v):
-                                        logger.error(f"[EmitPayload] ABORT: {k} is a function! Skipping emit.")
-                                        raise TypeError(f"Emit payload key '{k}' is a function, not serializable.")
-                                # --- PATCH: Robustly check payload for unserializable objects/functions ---
-                                def is_serializable(obj):
-                                    import numpy as np
-                                    import types
-                                    if isinstance(obj, (int, float, str, bool, type(None))):
-                                        return True
-                                    if isinstance(obj, (list, tuple)):
-                                        return all(is_serializable(x) for x in obj)
-                                    if isinstance(obj, dict):
-                                        return all(isinstance(k, str) and is_serializable(v) for k, v in obj.items())
-                                    if isinstance(obj, np.ndarray):
-                                        return True
-                                    if isinstance(obj, types.FunctionType):
-                                        return False
-                                    return False
-
-                                for k, v in payload.items():
-                                    if not is_serializable(v):
-                                        logger.error(f"[EmitPayload] UNSERIALIZABLE: {k}: type={type(v)}, repr={repr(v)}")
-                                        payload[k] = str(v)
-
-                                logger.info(f"[SessionManager] Emitting emotion_update to sid={sid} with payload: {payload}")
-                                self.socketio.emit('emotion_update', payload, room=sid)
                             else:
-                                logger.warning("[SessionManager] filtered_emotion is None, skipping emit block.")
+                                # fallback: try to get fused emotion
+                                fused_emotion = self._get_current_emotion()
+                                flat_emotion = {
+                                    'valence': fused_emotion.get('valence', 0) if fused_emotion else 0,
+                                    'arousal': fused_emotion.get('arousal', 0) if fused_emotion else 0,
+                                    'confidence': fused_emotion.get('confidence', 0.5) if fused_emotion else 0.5
+                                }
+                            trajectory_progress = status.get('trajectory_progress', {})
+                            music_parameters = status.get('music_parameters', {})
+
+                            payload = {
+                                'emotion_state': flat_emotion,
+                                'trajectory_progress': trajectory_progress,
+                                'music_parameters': music_parameters,
+                            }
+
+                            # Log type and repr for every value in payload
+                            for k, v in payload.items():
+                                logger.info(f"[EmitPayload] {k}: type={type(v)}, repr={repr(v)}")
+                                if callable(v):
+                                    logger.error(f"[EmitPayload] ABORT: {k} is a function! Skipping emit.")
+                                    raise TypeError(f"Emit payload key '{k}' is a function, not serializable.")
+                            # --- PATCH: Robustly check payload for unserializable objects/functions ---
+                            def is_serializable(obj):
+                                import numpy as np
+                                import types
+                                if isinstance(obj, (int, float, str, bool, type(None))):
+                                    return True
+                                if isinstance(obj, (list, tuple)):
+                                    return all(is_serializable(x) for x in obj)
+                                if isinstance(obj, dict):
+                                    return all(isinstance(k, str) and is_serializable(v) for k, v in obj.items())
+                                if isinstance(obj, np.ndarray):
+                                    return True
+                                if isinstance(obj, types.FunctionType):
+                                    return False
+                                return False
+
+                            for k, v in payload.items():
+                                if not is_serializable(v):
+                                    logger.error(f"[EmitPayload] UNSERIALIZABLE: {k}: type={type(v)}, repr={repr(v)}")
+                                    payload[k] = str(v)
+
+                            logger.info(f"[SessionManager] Emitting emotion_update to sid={sid} with payload: {payload}")
+                            self.socketio.emit('emotion_update', payload, room=sid)
+                        else:
+                            logger.warning("[SessionManager] filtered_emotion is None, skipping emit block.")
                     except Exception as e:
                         logger.error(f"[SessionManager] Failed to emit SocketIO events: {e}")
                 else:
@@ -420,42 +470,54 @@ class SessionManager:
                 voice_data=voice_dict
             )
             logger.debug(f"[SessionManager] emotion_fusion.fuse_emotions result: {fused_emotion}")
-            return fused_emotion
 
+            return fused_emotion
         except Exception as e:
             logger.error(f"Error fusing emotion data: {e}")
             return None
 
     def _process_emotion_update(self, session_time: float):
-        """Process emotion sensing and filtering"""
+        """Process emotion sensing and filtering, only update music if emotion is valid."""
         logger.info(f"[SessionManager] _process_emotion_update called at session_time={session_time}")
         try:
             fused_emotion = self._get_current_emotion()  # now returns full dict with mean + covariance
             logger.debug(f"[SessionManager] _get_current_emotion returned: {fused_emotion}")
 
+            # Check if emotion is valid (not default/zero)
+            is_valid = False
             if fused_emotion is not None:
-                # Kalman expects valence/arousal, not mean/covariance
+                v = fused_emotion.get('valence', None)
+                a = fused_emotion.get('arousal', None)
+                if v is not None and a is not None and (v != 0.0 or a != 0.0):
+                    is_valid = True
+
+            if is_valid:
+                # --- PHASE 2: Feed every fused emotion into the filter ---
                 filtered_state, _ = self.kalman_filter.update({
                     'valence': fused_emotion['valence'],
                     'arousal': fused_emotion['arousal'],
                     'uncertainty': fused_emotion.get('uncertainty', 0.5)
                 })
-
                 filtered_emotion = {
                     'valence': filtered_state[0],
-                    'arousal': filtered_state[1]
+                    'arousal': filtered_state[1],
+                    'confidence': fused_emotion.get('confidence', 0.5)
                 }
                 self._latest_filtered_emotion = filtered_emotion
                 logger.info(f"[SessionManager] Updating emotion with filtered data: {filtered_emotion}")
 
+                # Ensure timestamp is set for filtered_emotion
+                if 'timestamp' not in filtered_emotion or not np.isfinite(filtered_emotion.get('timestamp', None)):
+                    filtered_emotion['timestamp'] = time.time()
                 # Now also store full uncertainty trace
                 self.emotion_state.update_emotion({
                     'mean': filtered_emotion,
-                    'covariance': fused_emotion['covariance'],
-                    'uncertainty_trace': fused_emotion.get('uncertainty')
+                    'covariance': fused_emotion.get('covariance'),
+                    'uncertainty_trace': fused_emotion.get('uncertainty'),
+                    'timestamp': filtered_emotion['timestamp']
                 })
 
-                # --- NEW: Map filtered emotion to music parameters, log, and update renderer ---
+                # --- Map filtered emotion to music parameters, log, and update renderer ---
                 val = filtered_emotion['valence']
                 ar = filtered_emotion['arousal']
                 mapped_params = self.base_mapping.map_emotion_to_parameters(val, ar)
@@ -494,68 +556,103 @@ class SessionManager:
                         'session_time': session_time
                     })
             else:
-                logger.info("[SessionManager] No fused_emotion available for update.")
+                logger.warning("[SessionManager] Emotion state invalid or default/zero. Holding last music parameters.")
+                # Do not update music parameters, just hold last
+                # Optionally, emit a warning to frontend if needed
+                if self.app is not None and self.socketio is not None:
+                    sid = getattr(self, '_current_socketio_sid', None)
+                    if sid:
+                        self.socketio.emit('error', {'message': 'Emotion state invalid or default. Music parameters not updated.'}, room=sid)
 
         except Exception as e:
             logger.error(f"Error in emotion processing: {e}")
 
-    def _get_current_emotion(self) -> Optional[np.ndarray]:
-        """Get current emotion from sensors"""
+    def _get_current_emotion(self) -> Optional[dict]:
+        """Get current emotion from sensors, with robust fallback if queue is empty."""
         try:
-            # Try to get emotion from queue first (most recent)
+            logger.debug(f"[SessionManager] _get_current_emotion: queue size before get: {self.emotion_data_queue.qsize()}")
+            # Try to get emotion from queue first (most recent) with exponential backoff
             try:
-                emotion_data = self.emotion_data_queue.get_nowait()
+                # Exponential backoff for queue polling
+                timeout = min(0.1 * (2 ** min(self._empty_queue_counter, 5)), 1.0)
+                emotion_data = self.emotion_data_queue.get(timeout=timeout)
+                self._empty_queue_counter = 0  # Reset counter on success
                 logger.debug(f"[SessionManager] _get_current_emotion got from queue: {emotion_data}")
+                
+                # Update latest valid emotion and reset warning flags
+                with self.emotion_data_lock:
+                    self.latest_emotion_data = emotion_data.copy()
+                    self._last_valid_emotion_time = time.time()
+                    self._missing_data_warning_sent = False
+                
                 return emotion_data
             except queue.Empty:
-                logger.debug("[SessionManager] _get_current_emotion: emotion_data_queue empty.")
-                pass
-
-            # Fall back to latest emotion data
-            with self.emotion_data_lock:
-                if self.latest_emotion_data is not None:
-                    logger.debug(f"[SessionManager] _get_current_emotion using latest_emotion_data: {self.latest_emotion_data}")
-                    return self.latest_emotion_data.copy()
-
-            # No emotion data available
-            logger.debug("[SessionManager] _get_current_emotion: No emotion data available.")
-            return None
-
+                self._empty_queue_counter += 1
+                logger.debug(f"[SessionManager] _get_current_emotion: emotion_data_queue empty (count={self._empty_queue_counter}).")
+                
+                # Warn if empty for a long time
+                if self._empty_queue_counter % 10 == 0:
+                    logger.warning(f"Emotion data queue has been empty for {self._empty_queue_counter} consecutive polls.")
+                
+                # Fall back to latest valid emotion with higher priority
+                with self.emotion_data_lock:
+                    if self.latest_emotion_data is not None:
+                        logger.info("[SessionManager] Falling back to latest valid emotion data.")
+                        return self.latest_emotion_data.copy()
+                
+                # If no valid emotion ever, only then emit default
+                logger.warning("[SessionManager] No valid emotion data available (queue and history empty). Emitting default state.")
+                return {
+                    'valence': 0.0,
+                    'arousal': 0.0,
+                    'confidence': 0.5,
+                    'covariance': [[0.5, 0.0], [0.0, 0.5]],
+                    'uncertainty': 1.0,
+                    'timestamp': time.time(),
+                    'is_default': True  # Mark as default state for downstream handling
+                }
         except Exception as e:
             logger.error(f"Error getting current emotion: {e}")
-            return None
+            return {
+                'valence': 0.0,
+                'arousal': 0.0,
+                'confidence': 0.5,
+                'covariance': [[0.5, 0.0], [0.0, 0.5]],
+                'uncertainty': 1.0,
+                'timestamp': time.time()
+            }
 
     def _normalize_music_parameters(self, params):
         """Normalize music parameter keys to camelCase and ensure all expected keys are present for the frontend."""
-        # Map of snake_case to camelCase for frontend
-        key_map = {
-            'tempo_bpm': 'tempo',
-            'rhythm_complexity': 'rhythmComplexity',
-            'harmonic_complexity': 'harmonicComplexity',
-            'texture_density': 'textureDensity',
-            'overall_volume': 'volume',
-            'brightness': 'brightness',
-            'mode': 'mode',
-            'melodic_var': 'melodicVar',
-            'harmonic_var': 'harmonicVar',
-            # Add more as needed
-        }
-        # All keys expected by frontend
-        expected_keys = [
-            'tempo', 'rhythmComplexity', 'harmonicComplexity', 'textureDensity',
-            'volume', 'brightness', 'mode', 'melodicVar', 'harmonicVar'
-        ]
+        # Build mapping from parameter space
+        param_space = getattr(self, 'param_space', None)
+        if param_space is None:
+            param_space = MusicParameterSpace()
+        snake_keys = list(param_space.parameters.keys())
+        key_map = {k: snake_to_camel(k) for k in snake_keys}
+        # Inverse map for lookup
+        camel_keys = set(key_map.values())
         normalized = {}
+        # Map all known parameters
         for k, v in params.items():
-            camel = key_map.get(k, k)
+            camel = key_map.get(k, snake_to_camel(k))
             normalized[camel] = v
-        for k in expected_keys:
-            if k not in normalized:
-                normalized[k] = 0
+        # Ensure all expected keys are present
+        for snake, camel in key_map.items():
+            if camel not in normalized:
+                normalized[camel] = param_space.parameters[snake].default
+                logger.warning(f"[SessionManager] Music parameter '{snake}' missing in output; defaulting to {param_space.parameters[snake].default}")
+        # Optionally, warn about extra keys
+        for k in normalized:
+            if k not in camel_keys:
+                logger.warning(f"[SessionManager] Music parameter '{k}' not in parameter space (extra or legacy param)")
         return normalized
 
     def _normalize_trajectory_path(self, path):
-        """Ensure all trajectory path points are dicts with valence and arousal keys."""
+        """Ensure all trajectory path points are dicts with valence, arousal, and timestamp keys.
+        - For actual (recorded) trajectories, timestamp is the real session-relative time.
+        - For generated target trajectories, timestamp is the intended offset from session start (or None if not applicable).
+        """
         norm = []
         for pt in path:
             if isinstance(pt, dict):
@@ -572,18 +669,35 @@ class SessionManager:
         return norm
 
     def _get_trajectory_progress(self, session_time=None):
-        """Return a robust, always-present trajectory progress structure for frontend visualization."""
+        """Return a robust, always-present trajectory progress structure for frontend visualization.
+        Target trajectory points now include timestamps matching the session timeline (offset from session start).
+        """
         if session_time is None:
             session_time = time.time() - self.session_start_time if self.running else 0
-        actual_traj = self.emotion_state.get_emotion_trajectory() or []
+        
+        # Get raw trajectory data
+        raw_trajectory = self.emotion_state.get_emotion_trajectory() or []
+        
+        # Fix trajectory extraction - properly format actual_path
+        actual_traj = []
+        for point in raw_trajectory:
+            if 'mean' in point:
+                actual_traj.append({
+                    'valence': point['mean']['valence'],
+                    'arousal': point['mean']['arousal'],
+                    'timestamp': point['timestamp']
+                })
+        
         # --- FIX: Sample trajectory function if needed ---
         target_traj = []
         if hasattr(self.trajectory_planner, 'current_trajectory'):
             if callable(self.trajectory_planner.current_trajectory):
                 session_duration = self.config.session_duration
                 times = np.linspace(0, session_duration, 100)
+                # Each point is a dict with valence, arousal, and timestamp (offset from session start)
                 target_traj = [
-                    self.trajectory_planner.current_trajectory(t) for t in times
+                    {'valence': v, 'arousal': a, 'timestamp': float(t)}
+                    for t, (v, a) in zip(times, [self.trajectory_planner.current_trajectory(t) for t in times])
                 ]
             else:
                 target_traj = self.trajectory_planner.current_trajectory
@@ -707,6 +821,9 @@ class SessionManager:
             params = self.music_renderer.interpolate_parameters()
             # Render music structure
             music_struct = self.music_renderer.render(params)
+            # --- Ensure a Tidal pattern is always present ---
+            if 'pattern' not in music_struct or not music_struct['pattern']:
+                music_struct['pattern'] = generate_tidal_pattern(params)
             # Send to engine
             if self.music_engine:
                 self.music_engine.play(music_struct)

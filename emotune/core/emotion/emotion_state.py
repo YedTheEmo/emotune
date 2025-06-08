@@ -35,8 +35,29 @@ class EmotionState:
         self.emotion_history = deque(maxlen=history_length)
         self.raw_observations = deque(maxlen=history_length)
         
+    def _is_valid_emotion(self, emotion_dist: Any) -> bool:
+        """Check if an emotion distribution is valid (valence/arousal in [-1,1], finite, has timestamp)."""
+        if not isinstance(emotion_dist, dict):
+            return False
+        mean = emotion_dist.get('mean')
+        if not (isinstance(mean, dict) and 'valence' in mean and 'arousal' in mean):
+            return False
+        try:
+            v = float(mean['valence'])
+            a = float(mean['arousal'])
+            if not (-1.0 <= v <= 1.0 and -1.0 <= a <= 1.0):
+                return False
+            if not (np.isfinite(v) and np.isfinite(a)):
+                return False
+        except Exception:
+            return False
+        ts = emotion_dist.get('timestamp')
+        if ts is None or not np.isfinite(ts):
+            return False
+        return True
+
     def update_emotion(self, emotion_dist: Any):
-        """Update current emotion state with type and structure validation."""
+        """Update current emotion state with type, structure, and value validation."""
         logger.debug(f"[EmotionState] update_emotion called with: {emotion_dist}")
         # Type and structure validation
         if not isinstance(emotion_dist, dict):
@@ -57,6 +78,9 @@ class EmotionState:
             if not (np.isfinite(v) and np.isfinite(a)):
                 logger.warning("Emotion update contains non-finite values. Ignored.")
                 return
+            if not (-1.0 <= v <= 1.0 and -1.0 <= a <= 1.0):
+                logger.warning("Emotion update valence/arousal out of range [-1,1]. Ignored.")
+                return
         except Exception as e:
             logger.warning(f"Emotion update value error: {e}. Ignored.")
             return
@@ -64,8 +88,9 @@ class EmotionState:
         if not (isinstance(cov, list) and len(cov) == 2 and all(isinstance(row, list) and len(row) == 2 for row in cov)):
             logger.warning("Emotion update 'covariance' is not a 2x2 list. Ignored.")
             return
-        # If all checks pass, update state
-        emotion_dist['timestamp'] = time.time()
+        # Ensure timestamp
+        if 'timestamp' not in emotion_dist or not np.isfinite(emotion_dist['timestamp']):
+            emotion_dist['timestamp'] = time.time()
         self.current_emotion = emotion_dist
         self.emotion_history.append(emotion_dist.copy())
         logger.info(f"[EmotionState] Updated emotion. History length: {len(self.emotion_history)}. Latest: {emotion_dist}")
@@ -81,14 +106,16 @@ class EmotionState:
         return self.current_emotion.copy()
     
     def get_emotion_trajectory(self, time_window: float = 60.0) -> List[Dict]:
-        """Get emotion trajectory within time window"""
+        """Get emotion trajectory within time window. Always return at least the latest emotion if available."""
         current_time = time.time()
         cutoff_time = current_time - time_window
-        
         trajectory = [
             emotion for emotion in self.emotion_history
             if emotion['timestamp'] >= cutoff_time
         ]
+        if not trajectory and len(self.emotion_history) > 0:
+            # Fallback: return the latest emotion if nothing in window
+            trajectory = [self.emotion_history[-1]]
         logger.info(f"[EmotionState] get_emotion_trajectory returned {len(trajectory)} items.")
         logger.info(f"[EmotionState] get_emotion_trajectory returning {len(trajectory)} items")
         return trajectory
@@ -149,3 +176,7 @@ class EmotionState:
     def get_update_count(self) -> int:
         """Return the number of emotion updates recorded so far"""
         return len(self.emotion_history)
+
+    def is_valid(self) -> bool:
+        """Return True if the current emotion state is valid."""
+        return self._is_valid_emotion(self.current_emotion)

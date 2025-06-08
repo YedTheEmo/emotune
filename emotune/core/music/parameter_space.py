@@ -84,15 +84,16 @@ class MusicParameterSpace:
         return param.min_val + normalized_value * (param.max_val - param.min_val)
     
     def clip_parameters(self, params: Dict[str, float]) -> Dict[str, float]:
-        """Ensure all parameters are within valid ranges"""
+        """Ensure all parameters are within valid ranges and log any out-of-bounds values."""
         clipped = {}
+        logger = get_logger()
         for name, value in params.items():
-            
-            # The 90
-            
             if name in self.parameters:
                 param = self.parameters[name]
-                clipped[name] = np.clip(value, param.min_val, param.max_val)
+                clipped_value = np.clip(value, param.min_val, param.max_val)
+                if value != clipped_value:
+                    logger.warning(f"[MusicParameterSpace] Parameter '{name}' value {value} out of range, clipped to {clipped_value}")
+                clipped[name] = clipped_value
             else:
                 clipped[name] = value
         return clipped

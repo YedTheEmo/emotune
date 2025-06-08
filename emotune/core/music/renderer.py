@@ -27,35 +27,52 @@ class MusicRenderer:
         }
 
     def update_target_parameters(self, new_params: Dict[str, float]):
-        """Set new target parameters for smooth interpolation"""
+        """Set new target parameters for smooth interpolation, with validation and logging."""
+        # Validate and clip parameters
+        new_params = self.param_space.clip_parameters(new_params)
         self.target_params.update(new_params)
         self.step_counter = 0
+        logger = get_logger()
+        logger.info(f"[MusicRenderer] Updated target parameters: {self.target_params}")
 
     def interpolate_parameters(self) -> Dict[str, float]:
-        """Smoothly interpolate current parameters toward targets"""
+        """Smoothly interpolate current parameters toward targets with configurable steps and robust handling."""
         if self.step_counter >= self.interpolation_steps:
             return self.current_params.copy()
-        
-        # Linear interpolation with easing
+
+        # Linear interpolation with cosine easing
         alpha = self.step_counter / self.interpolation_steps
         alpha_eased = 0.5 * (1 - math.cos(alpha * math.pi))  # Cosine easing
-        
+
         for param_name in self.current_params:
             if param_name in self.target_params:
                 current = self.current_params[param_name]
                 target = self.target_params[param_name]
+                # Clamp to valid range
+                param_range = self.param_space.parameters.get(param_name)
+                if param_range:
+                    target = np.clip(target, param_range.min_val, param_range.max_val)
                 self.current_params[param_name] = current + alpha_eased * (target - current)
-        
+
         self.step_counter += 1
         return self.current_params.copy()
 
     def render(self, params: Dict[str, float]) -> Dict[str, Any]:
-        """Render a backend-agnostic music structure from parameters."""
+        """Render a backend-agnostic music structure from parameters, including Sonic Pi cue fields."""
         scale_type = self._select_scale(params)
         chord_prog = self._select_chord_progression(params)
         tempo = int(params.get('tempo_bpm', 120))
+        # Add Sonic Pi cue fields for direct mapping
         music_struct = {
-            'tempo': tempo,
+            'tempo_bpm': tempo,
+            'overall_volume': params.get('overall_volume', 0.7),
+            'voice_density': int(params.get('voice_density', 2)),
+            'brightness': params.get('brightness', 0.5),
+            'reverb_amount': params.get('reverb_amount', 0.3),
+            'articulation': params.get('articulation', 0.5),
+            'rhythm_complexity': params.get('rhythm_complexity', 0.5),
+            'dissonance_level': params.get('dissonance_level', 0.2),
+            'current_pattern': 0,  # You can add pattern selection logic here
             'scale': scale_type,
             'chord_progression': chord_prog,
             'melody': self._build_melody(params),

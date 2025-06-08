@@ -26,7 +26,11 @@ class FaceAnalyzer:
     """Simplified face emotion analyzer using EmoNet, matching legacy output"""
     def __init__(self, model_path=None, device='cpu'):
         self.device = torch.device(device)
-        self.mtcnn = MTCNN(keep_all=False, device=self.device)
+        self.mtcnn = MTCNN(
+            keep_all=False, 
+            device=self.device,
+            thresholds=[0.5, 0.6, 0.7]  # Lower thresholds for better face detection
+        )
         if model_path is None:
             model_path = os.path.join(emonet_path, 'pretrained', 'emonet_8.pth')
         self.model = EmoNet(n_expression=8).to(self.device)
@@ -46,9 +50,9 @@ class FaceAnalyzer:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         frame_path = os.path.join(debug_dir, f'frame_{ts}.jpg')
         Image.fromarray(frame_rgb).save(frame_path)
-        # Face detection
+        # Face detection with lower confidence threshold
         face, prob = self.mtcnn(img, return_prob=True)
-        if face is None or prob < 0.8:
+        if face is None or prob < 0.6:  # Reduced from 0.8 for better detection
             boxes, _ = self.mtcnn.detect(img)
             if boxes is not None and len(boxes) > 0:
                 arr_img = np.array(img)  # RGB array
@@ -62,7 +66,12 @@ class FaceAnalyzer:
                     crop_path = os.path.join(debug_dir, f'crop_{ts}.jpg')
                     Image.fromarray(crop).save(crop_path)
                     tensor = torch.from_numpy(crop).float().permute(2,0,1).unsqueeze(0).to(self.device)/255.0
-                    return self._process_emonet(tensor)
+                    em, cf = self._process_emonet(tensor)
+                    # Validate valence/arousal
+                    if not (-1.0 <= em['valence'] <= 1.0 and -1.0 <= em['arousal'] <= 1.0):
+                        logger.warning(f"[FaceAnalyzer] Out-of-range valence/arousal from model: {em}. Not logging.")
+                        return {'valence': 0.0, 'arousal': 0.0, 'discrete_emotions': em.get('discrete_emotions', {})}, 0.0
+                    return em, cf
             dist = {l: 1/8 for l in self.labels}
             return {'valence':0.0, 'arousal':0.0, 'discrete_emotions':dist}, 0.0
         arr = (face.permute(1,2,0).cpu().numpy() * 255)
@@ -71,7 +80,12 @@ class FaceAnalyzer:
         crop_path = os.path.join(debug_dir, f'crop_{ts}.jpg')
         Image.fromarray(arr).save(crop_path)
         tensor = torch.from_numpy(arr).float().permute(2,0,1).unsqueeze(0).to(self.device)/255.0
-        return self._process_emonet(tensor)
+        em, cf = self._process_emonet(tensor)
+        # Validate valence/arousal
+        if not (-1.0 <= em['valence'] <= 1.0 and -1.0 <= em['arousal'] <= 1.0):
+            logger.warning(f"[FaceAnalyzer] Out-of-range valence/arousal from model: {em}. Not logging.")
+            return {'valence': 0.0, 'arousal': 0.0, 'discrete_emotions': em.get('discrete_emotions', {})}, 0.0
+        return em, cf
 
     def _process_emonet(self, tensor: torch.Tensor) -> tuple:
         """Shared EmoNet processing for both paths"""
@@ -102,9 +116,18 @@ class VoiceAnalyzer:
             preds = torch.tanh(logits).cpu().numpy()[0]
         # Audeering: [arousal, dominance, valence]
         val, aro = float(preds[2]), float(preds[0])
-        # confidence as mean abs
-        conf = float(np.mean(np.abs([val, aro])))
-        conf = max(0.3, min(1.0, conf))
+        # Validate valence/arousal
+        if not (-1.0 <= val <= 1.0 and -1.0 <= aro <= 1.0):
+            logger.warning(f"[VoiceAnalyzer] Out-of-range valence/arousal from model: val={val}, aro={aro}. Not logging.")
+            return {'valence': 0.0, 'arousal': 0.0}, 0.0
+        # Improved confidence calculation
+        # Use a combination of prediction magnitude and signal energy
+        signal_energy = np.mean(np.abs(audio))
+        pred_magnitude = np.mean(np.abs([val, aro]))
+        
+        # Scale confidence based on both factors
+        conf = float(pred_magnitude * 0.7 + min(signal_energy / 0.1, 0.3))
+        conf = max(0.3, min(0.9, conf))  # Ensure reasonable range
         return {'valence':val, 'arousal':aro}, conf
 
 class EmotionAnalyzer:
@@ -122,4 +145,3 @@ class EmotionAnalyzer:
             em, cf = self.voice.analyze_audio(audio, sample_rate=sr)
             res['voice'] = {'emotions': em, 'confidence': cf}
         return res
-

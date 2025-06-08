@@ -15,7 +15,7 @@ from emotune.utils.logging import setup_logging, get_logger
 from emotune.utils.data_persistence import EmoTuneDatabase
 
 # Load config
-cfg_path = os.path.join(os.path.dirname(__file__), "config", "default.json")
+cfg_path = os.path.join(os.getcwd(), "config", "default.json")
 with open(cfg_path) as f:
     cfg_dict = json.load(f)
 config = SimpleNamespace(**cfg_dict)

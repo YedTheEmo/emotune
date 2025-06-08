@@ -15,6 +15,7 @@
   "rl": {},
   "trajectory": {},
   "music": {},
+  "music_engine": "sonicpi",
   "session": {
       "device": "cpu",
       "camera_index": 0,

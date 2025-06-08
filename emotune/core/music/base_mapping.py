@@ -48,21 +48,35 @@ class BaseMappingEngine:
             "repetition_factor": lambda v, a: 0.8 - 0.3 * a,  # Lower arousal = more repetition
             "development_rate": lambda v, a: 0.2 + 0.6 * a  # Higher arousal = faster development
         }
+        # Ensure all parameters in parameter space are mapped (explicitly or as default)
+        for name in self.param_space.parameters:
+            if name not in self.mappings:
+                # Default: return the default value regardless of v/a
+                default_val = self.param_space.parameters[name].default
+                self.mappings[name] = lambda v, a, d=default_val: d
     
     def map_emotion_to_parameters(self, valence: float, arousal: float) -> Dict[str, float]:
-        """Convert valence-arousal values to music parameters"""
+        """Convert valence-arousal values to music parameters. All mappings are documented."""
         # Ensure inputs are in valid range
         valence = np.clip(valence, 0, 1)
         arousal = np.clip(arousal, 0, 1)
-        
+
         # Apply mappings
         params = {}
         for param_name, mapping_func in self.mappings.items():
             params[param_name] = mapping_func(valence, arousal)
 
-        
         # Clip to valid ranges
-        return self.param_space.clip_parameters(params)
+        params = self.param_space.clip_parameters(params)
+
+        # Ensure all parameters in parameter space are present and document mapping
+        for name, param in self.param_space.parameters.items():
+            if name not in params:
+                params[name] = param.default
+                # Document unmapped parameter
+                import warnings
+                warnings.warn(f"Music parameter '{name}' is not explicitly mapped from emotion; using default value {param.default}.")
+        return params
     
     def get_parameter_sensitivity(self, param_name: str) -> Tuple[float, float]:
         """Get parameter sensitivity to valence and arousal changes"""

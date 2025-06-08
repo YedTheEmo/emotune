@@ -49,13 +49,17 @@ class EmotionCapture:
                 raise
 
     def stop_capture(self):
-        """Stop capture and cleanup"""
+        """Stop capture and cleanup, with robust shutdown flag and thread join."""
         with self._start_lock:
             logger.info(f"[EmotionCapture] stop_capture called. running={self.running}, capture_thread={self.capture_thread}")
             self.running = False
+            # NEW: Wait for thread to finish, with timeout
             if self.capture_thread:
-                self.capture_thread.join(timeout=3.0)
-                logger.debug("[EmotionCapture] capture_thread joined.")
+                self.capture_thread.join(timeout=5.0)
+                if self.capture_thread.is_alive():
+                    logger.warning("[EmotionCapture] capture_thread did not exit cleanly after join timeout.")
+                else:
+                    logger.debug("[EmotionCapture] capture_thread joined.")
             self.capture_thread = None
             logger.info("Emotion capture stopped")
 
@@ -156,13 +160,15 @@ class EmotionCapture:
                         logger.debug("[EmotionCapture] Oldest data dropped, new data put in queue.")
                     except queue.Empty:
                         logger.error("[EmotionCapture] Data queue full and empty on get_nowait().")
-                logger.log_emotion(
-                    valence=np.mean(frame_rgb) if frame_rgb is not None else 0,
-                    arousal=0,  # Placeholder, real arousal should be computed if available
-                    confidence=1.0 if frame_rgb is not None else 0.0,
-                    source='face',
-                    raw_data={'frame_shape': frame_rgb.shape if frame_rgb is not None else None}
-                )
+                # --- DO NOT log mean pixel value as valence; only log after emotion model inference ---
+                # logger.log_emotion(
+                #     valence=np.mean(frame_rgb) if frame_rgb is not None else 0,
+                #     arousal=0,  # Placeholder, real arousal should be computed if available
+                #     confidence=1.0 if frame_rgb is not None else 0.0,
+                #     source='face',
+                #     raw_data={'frame_shape': frame_rgb.shape if frame_rgb is not None else None}
+                # )
+                # Emotion logging should occur after model analysis, not here.
                 last_snapshot_time = now
             time.sleep(0.01)
         logger.info("[EmotionCapture] Exiting _capture_loop, releasing camera.")

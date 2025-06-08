@@ -84,6 +84,8 @@ class EmoTuneClient {
         });
         this.socket.on('error', (data) => {
             this.showNotification(data.message, 'error');
+            // Optionally, log to console for debugging
+            console.error('EmoTune error:', data.message);
         });
     }
     
@@ -230,6 +232,10 @@ class EmoTuneClient {
 
     handleEmotionUpdate(data) {
         console.log('[EmoTune] handleEmotionUpdate called:', data);
+        // --- Show backend warning if present ---
+        if (data && data.warning) {
+            this.showNotification(data.warning, 'warning');
+        }
         // --- ADDED: Confirm receipt of emotion_update from backend ---
         if (data && data.emotion_state) {
             console.info('[EmoTune] Received emotion_update from backend:', data.emotion_state);
@@ -406,9 +412,14 @@ class EmoTuneClient {
         }
         // Update parameter bars (handle undefined gracefully)
         this.updateParameterBar('rhythmComplexity', musicParams.rhythm_complexity);
-        this.updateParameterBar('harmonicComplexity', musicParams.harmonic_complexity);
-        this.updateParameterBar('textureDensity', musicParams.texture_density);
+        this.updateParameterBar('harmonicComplexity', musicParams.chord_complexity);
+        this.updateParameterBar('textureDensity', musicParams.voice_density);
         this.updateParameterBar('volumeLevel', musicParams.volume || musicParams.overall_volume);
+        // Add all other music parameters for debugging/visibility
+        const debugDiv = document.getElementById('musicParamDebug');
+        if (debugDiv) {
+            debugDiv.innerHTML = '<b>All Music Parameters:</b><br>' + Object.entries(musicParams).map(([k,v]) => `${k}: ${v}`).join('<br>');
+        }
     }
     
     updateParameterBar(elementId, value) {

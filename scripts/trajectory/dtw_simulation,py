@@ -1,0 +1,55 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from dtaidistance import dtw
+
+# Seed for reproducibility
+np.random.seed(42)
+
+# Simulate target emotion trajectory (Valence-Arousal)
+time_steps = 50
+t = np.linspace(0, 2 * np.pi, time_steps)
+valence_target = np.sin(t)        # Smooth oscillation
+arousal_target = np.cos(t) * 0.5  # Lower amplitude
+
+# Simulate actual emotion trajectory with noise and slight timing offset
+valence_actual = np.sin(t + 0.2) + np.random.normal(0, 0.1, time_steps)
+arousal_actual = (np.cos(t + 0.2) * 0.5) + np.random.normal(0, 0.1, time_steps)
+
+# Combine into 2D trajectories
+target_traj = np.vstack((valence_target, arousal_target)).T
+actual_traj = np.vstack((valence_actual, arousal_actual)).T
+
+# Compute DTW distance (on concatenated dimensions)
+target_flat = np.concatenate([valence_target, arousal_target])
+actual_flat = np.concatenate([valence_actual, arousal_actual])
+distance = dtw.distance(target_flat, actual_flat)
+
+# Plotting
+plt.figure(figsize=(10, 5))
+
+# Valence-Arousal trajectory comparison
+plt.subplot(1, 2, 1)
+plt.plot(valence_target, arousal_target, label='Target', linewidth=2)
+plt.plot(valence_actual, arousal_actual, label='Actual', linestyle='--')
+plt.title("Valence-Arousal Trajectories")
+plt.xlabel("Valence")
+plt.ylabel("Arousal")
+plt.legend()
+plt.grid(True)
+
+# Time series view
+plt.subplot(1, 2, 2)
+plt.plot(t, valence_target, label='Valence Target')
+plt.plot(t, valence_actual, label='Valence Actual', linestyle='--')
+plt.plot(t, arousal_target, label='Arousal Target')
+plt.plot(t, arousal_actual, label='Arousal Actual', linestyle='--')
+plt.title("Time Series of Emotions")
+plt.xlabel("Time")
+plt.ylabel("Value")
+plt.legend()
+plt.grid(True)
+
+plt.suptitle(f"DTW Distance: {distance:.2f}")
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+plt.show()
+

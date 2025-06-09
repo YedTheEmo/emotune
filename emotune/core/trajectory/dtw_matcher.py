@@ -10,6 +10,68 @@ class DTWMatcher:
     
     def __init__(self, window_size: int = None):
         self.window_size = window_size
+
+    def match(self, trajectory1: np.ndarray, trajectory2: np.ndarray) -> Tuple[float, np.ndarray]:
+        """
+        Compute DTW distance and path between two trajectories
+        Each trajectory is a numpy array of (valence, arousal) points
+        
+        Returns:
+            Tuple of (distance, path) where path is a 2xN array of indices
+        """
+        if trajectory1.ndim != 2 or trajectory2.ndim != 2:
+            raise ValueError("Trajectories must be 2D arrays")
+            
+        # Convert to list of tuples for compatibility
+        traj1 = [tuple(p) for p in trajectory1]
+        traj2 = [tuple(p) for p in trajectory2]
+        
+        n, m = len(traj1), len(traj2)
+        
+        # Create distance matrix
+        dist_matrix = np.full((n, m), np.inf)
+        for i in range(n):
+            for j in range(m):
+                if self._in_window(i, j, n, m):
+                    dist_matrix[i, j] = self._euclidean_distance(traj1[i], traj2[j])
+        
+        # DTW dynamic programming
+        dtw_matrix = np.full((n + 1, m + 1), np.inf)
+        dtw_matrix[0, 0] = 0
+        
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                if self._in_window(i-1, j-1, n, m):
+                    cost = dist_matrix[i-1, j-1]
+                    dtw_matrix[i, j] = cost + min(
+                        dtw_matrix[i-1, j],      # insertion
+                        dtw_matrix[i, j-1],      # deletion
+                        dtw_matrix[i-1, j-1]     # match
+                    )
+        
+        # Backtrace to find path
+        path = []
+        i, j = n-1, m-1
+        path.append((i, j))
+        
+        while i > 0 and j > 0:
+            min_val = min(
+                dtw_matrix[i-1, j],
+                dtw_matrix[i, j-1],
+                dtw_matrix[i-1, j-1]
+            )
+            if min_val == dtw_matrix[i-1, j-1]:
+                i, j = i-1, j-1
+            elif min_val == dtw_matrix[i-1, j]:
+                i -= 1
+            else:
+                j -= 1
+            path.append((i, j))
+        
+        path.reverse()
+        path = np.array(path).T  # Convert to 2xN array
+        
+        return dtw_matrix[n, m], path
         
     def compute_dtw_distance(self, trajectory1: List[Tuple[float, float]], 
                            trajectory2: List[Tuple[float, float]]) -> float:

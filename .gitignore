@@ -17,6 +17,8 @@ venv/
 *.conda
 *.env
 *.yml
+!environment.yml
+
 
 # Distribution / packaging
 .Python

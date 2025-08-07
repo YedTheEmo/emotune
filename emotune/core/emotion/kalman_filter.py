@@ -62,34 +62,51 @@ class KalmanEmotionFilter:
         v = observation.get('valence', 0.0)
         a = observation.get('arousal', 0.0)
         confidence = observation.get('confidence', 0.5)
+        
+        # FIXED: Handle numpy arrays properly
+        if isinstance(v, np.ndarray):
+            v = float(v.item() if v.size == 1 else v[0])
+        if isinstance(a, np.ndarray):
+            a = float(a.item() if a.size == 1 else a[0])
+        
         z = np.array([v, a])
+        
         # Adaptive measurement noise based on uncertainty
         uncertainty = observation.get('uncertainty', 0.5)
         R = self.R_default * (1.0 + uncertainty * 2.0)
+        
         # --- NEW: Use confidence for covariance if provided ---
         if confidence is not None and confidence > 0:
             self.P[:2, :2] = np.diag([confidence, confidence])
-        # Validity checks
-        if not np.isfinite(v) or not np.isfinite(a):
+        
+        # Validity checks - FIXED: Use proper numpy methods instead of boolean array comparison
+        if not (np.isfinite(v) and np.isfinite(a)):
             logger.warning("Kalman update received non-finite valence/arousal. Skipping update.")
             return self.x.copy(), self.P.copy()
+        
         if not self.initialized:
             # Initialize state with first observation
             self.x[:2] = z
             self.x[2:] = 0  # Zero velocity
             self.initialized = True
             return self.x.copy(), self.P.copy()
+        
         # Innovation
         y = z - self.H @ self.x
+        
         # Innovation covariance
         S = self.H @ self.P @ self.H.T + R
+        
         # Kalman gain
         K = self.P @ self.H.T @ np.linalg.inv(S)
+        
         # Update state
         self.x = self.x + K @ y
+        
         # Update covariance
         I_KH = np.eye(self.state_dim) - K @ self.H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+        
         return self.x.copy(), self.P.copy()
     
     def get_emotion_distribution(self) -> Dict:

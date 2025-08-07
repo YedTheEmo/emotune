@@ -186,6 +186,7 @@ class RLAgent:
         
         # Current parameter values
         self.current_params = param_space.get_default_parameters()
+        self.latest_reward = 0.0
             
     def get_state_vector(self, emotion_mean: np.ndarray, emotion_cov: list, 
                         dtw_error: float, trajectory_progress: float) -> np.ndarray:
@@ -226,29 +227,26 @@ class RLAgent:
         self.current_params = self.param_space.clip_parameters(self.current_params)
         return self.current_params.copy()
     
-    def store_transition(self, state: np.ndarray, action: Dict[str, float], 
-                        reward: float, next_state: np.ndarray, done: bool):
-        """Store experience in replay buffer"""
-        # Convert action dict to array
+    def store_experience(self, state: np.ndarray, action: Dict[str, float], next_state: np.ndarray, reward: float, done: bool):
+        """Store a complete transition in the replay buffer."""
         action_array = np.array([action.get(param, 0.0) for param in self.param_names])
-        
         self.replay_buffer.push(state, action_array, reward, next_state, done)
+        self.latest_reward = reward
     
-    def store_experience(self, state: np.ndarray, emotion: dict, deviation: float, session_time: float):
-        """Store experience for RL training. This is a wrapper for store_transition."""
-        # For now, we use a placeholder reward and next_state, done
-        # In a real system, reward and next_state should be computed based on feedback and environment
-        action = self.select_action(state)
-        reward = -abs(deviation)  # Example: negative deviation as reward
-        next_state = state  # Placeholder: in practice, should be the next observed state
-        done = False  # Placeholder: set True if session ends
-        self.store_transition(state, action, reward, next_state, done)
-
     def get_training_summary(self) -> dict:
         """Return a summary of RL training status."""
         return {
             'buffer_size': len(self.replay_buffer),
             'current_params': self.current_params.copy(),
+        }
+
+    def get_status(self) -> dict:
+        """Return a comprehensive status of the RL agent."""
+        return {
+            'buffer_size': len(self.replay_buffer),
+            'learning_rate': self.sac.lr,
+            'reward_signal': self.latest_reward,
+            'policy_confidence': torch.exp(self.sac.log_alpha).item(),
         }
     
     def train(self, batch_size: int = 256):

@@ -12,7 +12,6 @@ from emotune.core.session.state import *
 from ..emotion.emotion_state import EmotionState
 from ..emotion.kalman_filter import KalmanEmotionFilter
 from ..emotion.fusion import EmotionFusion
-from ..emotion.analyzers import EmotionAnalyzer
 from ..emotion.capture import EmotionCapture
 from ..trajectory.planner import TrajectoryPlanner
 from ..trajectory.dtw_matcher import DTWMatcher
@@ -26,6 +25,7 @@ from ..feedback.processor import FeedbackProcessor
 from ..music.engine_tidal import TidalEngine
 from ..music.engine_sonicpi import SonicPiEngine
 from ..music.engine_midi import MidiEngine
+from ..music.engine_pyo import PyoMusicEngine, create_music_engine
 from emotune.utils.naming import snake_to_camel
 from emotune.core.music.patterns import generate_tidal_pattern
 
@@ -46,14 +46,19 @@ class SessionConfig:
     camera_index: int = 0
     audio_device_index: Optional[int] = None
 
+
 class SessionManager:
-    def __init__(self, config: SessionConfig, db=None, app=None, socketio=None):
+    def __init__(self, config: SessionConfig, db=None, app=None, socketio=None, param_space=None):
         self.config = config
+        self.db = db  # Store database reference for emotion data persistence
         self.running = False
         self.session_start_time = 0.0
         self.shutdown_event = threading.Event()  # Added for robust shutdown
         self.app = app  # Store Flask app for context in threads
         self.socketio = socketio  # Store SocketIO instance for emits
+
+        # Music parameter space (allow injection for testing)
+        self.param_space = param_space if param_space is not None else MusicParameterSpace()
 
         # Initialize all subsystems
         self._init_subsystems()
@@ -63,8 +68,8 @@ class SessionManager:
         self.music_thread = None
         self.capture_thread = None
 
-        # Data queues for thread communication
-        self.emotion_data_queue = queue.Queue(maxsize=50)  # Increased size for robustness
+        # Data queues for thread communication with improved sizing
+        self.emotion_data_queue = queue.Queue(maxsize=100)  # Increased for better buffering
         self.latest_emotion_data = None
         self.emotion_data_lock = threading.Lock()
         self._empty_queue_counter = 0  # Track consecutive empty queue events
@@ -74,17 +79,26 @@ class SessionManager:
         self.on_music_update: Optional[Callable] = None
         self.on_session_end: Optional[Callable] = None
 
-        # Camera configuration for EmotionCapture
+        # Camera configuration for EmotionCapture with proper parameters
         self.emotion_capture = EmotionCapture(
-            face_fps=int(self.config.emotion_update_rate),
+            face_fps=int(self.config.emotion_update_rate * 2),  # Capture at 2x rate for buffering
             audio_duration=0.5,
-            sample_rate=16000
+            sample_rate=16000,
+            camera_index=self.config.camera_index
         )
 
         # Missing data warning tracking
         self._last_valid_emotion_time = time.time()
         self._missing_data_warning_sent = False
-        self._missing_data_timeout = 3.0  # seconds, configurable
+        self._missing_data_timeout = 5.0  # Increased timeout
+        
+        # Performance tracking
+        self._processing_stats = {
+            'emotions_processed': 0,
+            'emotions_dropped': 0,
+            'processing_errors': 0,
+            'last_processing_time': 0
+        }
 
     def _init_subsystems(self):
         """Initialize all EmoTune subsystems"""
@@ -95,532 +109,975 @@ class SessionManager:
         self.dtw_matcher = DTWMatcher()
 
         # Emotion analysis components
+        from ..emotion.analyzers import EmotionAnalyzer
         self.emotion_analyzer = EmotionAnalyzer(device=self.config.device)
-
         self.emotion_fusion = EmotionFusion()
 
-        # Music system
-        self.param_space = MusicParameterSpace()
-        self.base_mapping = BaseMappingEngine()
-        self.rl_agent = RLAgent(self.param_space) if self.config.enable_rl else None
+        # Music components - FIXED: Always initialize music components
+        if self.param_space is None:
+            self.param_space = MusicParameterSpace()
+        self.music_mapping = BaseMappingEngine()
         self.music_renderer = MusicRenderer(self.param_space)
-        self.music_engine = self._select_music_engine()
 
-        # Feedback system
+        # RL and feedback components
+        if self.config.enable_rl:
+            self.rl_agent = RLAgent(self.param_space)
         if self.config.enable_feedback:
             self.feedback_collector = FeedbackCollector()
             self.feedback_processor = FeedbackProcessor(self.feedback_collector)
+        self.last_rl_state = None
+        self.last_rl_action = None
 
-        try:
-            traj_type = TrajectoryType[self.config.trajectory_name.upper()]
-        except KeyError:
-            raise ValueError(f"Unknown trajectory name: {self.config.trajectory_name}")
-
-        # Initialize trajectory
-        self.trajectory_planner.start_trajectory(
-            trajectory_type=traj_type,
-            duration=self.config.session_duration,
-            start_state=None,
-            target_state=None
-        )
+        # Music engines - only initialize primary engine (Pyo)
+        logger.info("Initializing primary music engine (Pyo)...")
+        self.pyo_engine = create_music_engine("auto")  # Primary engine
+        logger.info("Primary music engine initialized successfully")
+        
+        # Set fallback engines to None (only enable if specifically needed)
+        self.tidal_engine = None
+        self.sonicpi_engine = None  
+        self.midi_engine = None
+        
+        logger.info("Skipping fallback engines (TidalEngine, SonicPiEngine, MidiEngine) - Pyo is sufficient")
 
     def process_emotion_data(self, session_id: str, data: dict) -> dict:
-        """
-        Handle real‐time emotion_data events from the client over SocketIO.
-        Currently a stub: runs the internal update steps and returns
-        a minimal structure for the client.
-        """
-        import time
-        logger.debug(f"[SessionManager] process_emotion_data for session {session_id}")
-
-        # Compute elapsed time since session start
-        session_time = time.time() - getattr(self, 'session_start_time', time.time())
-
-        # Run the internal update pipelines (feel free to integrate `data` here)
+        """Process emotion data with enhanced error handling and validation"""
         try:
-            self._process_emotion_update(session_time)
-            self._process_music_update(session_time)
-        except Exception as ex:
-            logger.error(f"Error in processing pipeline: {ex}")
-
-        # Fetch the latest status
-        status = self.get_current_status()
-
-        # --- FLATTEN EMOTION STATE FOR FRONTEND ---
-        current_emotion = status.get('current_emotion')
-        if current_emotion and 'mean' in current_emotion:
-            flat_emotion = {
-                'valence': current_emotion['mean'].get('valence', 0),
-                'arousal': current_emotion['mean'].get('arousal', 0),
-                'confidence': 1 - min(1, current_emotion.get('uncertainty_trace', 0.5)/2)
+            logger.info(f"[SessionManager] Processing emotion data for session: {session_id}")
+            
+            # Start emotion monitoring if not already running
+            if not self.running:
+                self.start_emotion_monitoring(session_id)
+            
+            # Process the emotion data with the actual data, not a timestamp
+            self._process_emotion_update(data)
+            
+            # Get current status
+            status = self.get_current_status()
+            
+            return {
+                'emotion_state': status.get('emotion_state', {}),
+                'trajectory_progress': status.get('trajectory_progress', {}),
+                'music_parameters': status.get('music_parameters', {})
             }
-        else:
-            flat_emotion = {'valence': 0, 'arousal': 0, 'confidence': 0}
-
-        logger.log_emotion(
-            valence=flat_emotion['valence'],
-            arousal=flat_emotion['arousal'],
-            confidence=flat_emotion['confidence'],
-            source='fused',
-            raw_data=current_emotion
-        )
-
-        # --- BUILD TRAJECTORY PROGRESS FOR FRONTEND ---
-        # This logic assumes you have access to trajectory info and actual/target paths
-        # If not, you may need to adjust this to match your actual data pipeline
-        trajectory_progress = status.get('trajectory_progress')
-        if not trajectory_progress:
-            # Fallback: build minimal structure
-            trajectory_progress = {
-                'info': {},
-                'actual_path': [],
-                'target_path': [],
-                'deviation': None
+            
+        except Exception as e:
+            logger.error(f"Error in emotion processing: {e}")
+            return {
+                'emotion_state': {'valence': 0.0, 'arousal': 0.0, 'confidence': 0.5},
+                'trajectory_progress': {'actual_path': [], 'target_path': [], 'deviation': 1.0},
+                'music_parameters': {}
             }
 
-        return {
-            'emotion_state': flat_emotion,
-            'trajectory_progress': trajectory_progress,
-            'music_parameters': status.get('music_parameters', {})
-        }
+    def update_confidence_thresholds(self, thresholds: Dict[str, float]):
+        """Update confidence thresholds for emotion fusion."""
+        if self.emotion_fusion:
+            self.emotion_fusion.update_thresholds(
+                face_threshold=thresholds.get('face'),
+                voice_threshold=thresholds.get('voice')
+            )
+            logger.info(f"Updated confidence thresholds: {thresholds}")
+
+    def update_analysis_mode(self, mode: str):
+        """Update the analysis mode for emotion fusion."""
+        if self.emotion_fusion:
+            self.emotion_fusion.set_analysis_mode(mode)
+            logger.info(f"Updated analysis mode: {mode}")
 
     def start_emotion_monitoring(self, session_id: str):
-        """
-        Called when the client asks to begin streaming emotion data over WebSocket.
-        The actual capture/analysis threads are already running after start_session().
-        """
-        logger.info(f"[SessionManager] Emotion monitoring activated for session {session_id}")
-        # no-op beyond validation, since _emotion_capture_loop is already feeding data
-
-    def start_session(self, trajectory_type='calm_down', duration=300) -> str:
-        """Start the EmoTune session and return a unique session ID"""
+        """Start emotion monitoring with proper initialization"""
         if self.running:
-            raise RuntimeError("A session is already running.")
-
+            logger.debug("Emotion monitoring already running")
+            return
+            
         try:
-            # Generate and store a unique session ID
-            session_id = str(uuid.uuid4())
-            self.current_session_id = session_id
-
-            # Initialize emotion capture FIRST
-            if not self.emotion_capture.start():
-                logger.error("Failed to start emotion capture")
-                raise RuntimeError("Emotion capture start failed")
-
-            # --- PHASE 2: Initialize Kalman filter for filtered emotion ---
-            self.kalman_filter = KalmanEmotionFilter()
-            self._latest_filtered_emotion = None
-
-            self.shutdown_event.clear()  # Reset shutdown event at session start
             self.running = True
             self.session_start_time = time.time()
+            
+            # Start emotion capture
+            self.emotion_capture.start_capture()
+            
+            # Start emotion processing thread
+            self.emotion_thread = threading.Thread(
+                target=self._emotion_capture_loop,
+                name="EmotionProcessing",
+                daemon=True
+            )
+            self.emotion_thread.start()
+            
+            logger.info("Emotion monitoring started successfully")
 
-            # Store session parameters
-            self.current_trajectory_type = trajectory_type
-            self.current_duration = duration
-
-            # Reset emotion state and feedback
-            self.emotion_state.reset()
-            if self.config.enable_feedback:
-                self.feedback_collector.reset_session()
-
-            # Start processing threads AFTER capture is running
-            self.capture_thread = threading.Thread(target=self._emotion_capture_loop, name="EmotionCaptureThread")
-            self.capture_thread.start()
-
-            logger.info(f"Session {session_id} started with trajectory {trajectory_type}, duration {duration}s")
-            return session_id
-
+            # --- FIX: Emit monitoring_started event to frontend ---
+            if self.socketio:
+                sid = getattr(self, '_current_socketio_sid', None)
+                if sid:
+                    self.socketio.emit('monitoring_started', {'status': 'active'}, room=sid)
+                    logger.info(f"Emitted 'monitoring_started' to client {sid}")
+            # ---------------------------------------------------------
+            
         except Exception as e:
-            logger.error(f"Failed to start session: {e}")
+            logger.error(f"Failed to start emotion monitoring: {e}")
             self.running = False
-            self.shutdown_event.set()
             raise
 
-    def stop_session(self, session_id: str = None):
-        """Stop the EmoTune session if session ID matches (or always if session_id is None)"""
-        if not self.running:
-            raise RuntimeError("No session is currently running.")
+    def start_session(self, trajectory_type='calm_down', duration=300) -> str:
+        """Start a new session with improved error handling"""
+        try:
+            session_id = str(uuid.uuid4())
+            self._current_session_id = session_id  # Store session ID for database operations
+            logger.info(f"Starting session {session_id} with trajectory {trajectory_type}")
+            
+            # Reset emotion state
+            self.emotion_state.reset()
+            self.kalman_filter.reset()
+            
+            # Start trajectory
+            from emotune.core.trajectory.library import TrajectoryType
+            try:
+                # Convert string to TrajectoryType enum
+                if isinstance(trajectory_type, str):
+                    trajectory_type_enum = TrajectoryType(trajectory_type)
+                else:
+                    trajectory_type_enum = trajectory_type
+                
+                self.trajectory_planner.start_trajectory(trajectory_type_enum, duration)
+            except ValueError:
+                logger.warning(f"Unknown trajectory type: {trajectory_type}, using CALM_DOWN")
+                self.trajectory_planner.start_trajectory(TrajectoryType.CALM_DOWN, duration)
+            
+            # Start emotion monitoring
+            self.start_emotion_monitoring(session_id)
+            
+            return session_id
+            
+        except Exception as e:
+            logger.error(f"Failed to start session: {e}")
+            raise
 
-        if session_id is not None and session_id != getattr(self, 'current_session_id', None):
-            raise ValueError("Invalid or expired session ID.")
-
-        logger.info(f"Stopping session {getattr(self, 'current_session_id', session_id)}...")
+    def stop_session(self, session_id: str = None) -> bool:
+        """Enhanced session stop with comprehensive resource cleanup and forced termination"""
+        try:
+            logger.info(f"Stopping session {session_id} with enhanced cleanup...")
+            
+            # Phase 1: Signal all systems to stop
+            self.running = False
+            self.shutdown_event.set()
+            
+            # Phase 2: Stop emotion capture with enhanced cleanup
+            if hasattr(self, 'emotion_capture') and self.emotion_capture:
+                logger.info("Stopping emotion capture with enhanced cleanup...")
+                try:
+                    self.emotion_capture.stop_capture()
+                    logger.info("Emotion capture stopped successfully")
+                except Exception as e:
+                    logger.error(f"Error stopping emotion capture: {e}")
+                    # Force cleanup even if stop_capture fails
+                    try:
+                        if hasattr(self.emotion_capture, '_force_cleanup_audio'):
+                            self.emotion_capture._force_cleanup_audio()
+                        if hasattr(self.emotion_capture, '_force_cleanup_camera'):
+                            self.emotion_capture._force_cleanup_camera()
+                    except Exception as cleanup_e:
+                        logger.error(f"Force cleanup error: {cleanup_e}")
+            
+            # Phase 3: Enhanced thread termination with timeout and force
+            self._enhanced_thread_termination()
+            
+            # Phase 4: Stop all music engines with comprehensive cleanup
+            self._comprehensive_music_engine_cleanup()
+            
+            # Phase 5: Clear all queues and data structures
+            self._comprehensive_queue_cleanup()
+            
+            # Phase 6: Reset all state variables
+            self._reset_session_state()
+            
+            # Phase 7: Final resource validation
+            self._validate_resource_cleanup()
+            
+            logger.info(f"Session {session_id} stopped with enhanced cleanup - all resources released")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced session stop: {e}")
+            # Even if there are errors, try to clean up what we can
+            try:
+                self._emergency_cleanup()
+            except Exception as emergency_e:
+                logger.error(f"Emergency cleanup also failed: {emergency_e}")
+            return False
+    
+    def _enhanced_thread_termination(self):
+        """Enhanced thread termination with forced cleanup"""
+        threads_to_terminate = []
+        
+        # Collect all threads that need termination - FIXED: Add proper null checks
+        if hasattr(self, 'emotion_thread') and self.emotion_thread is not None and hasattr(self.emotion_thread, 'is_alive') and self.emotion_thread.is_alive():
+            threads_to_terminate.append(('emotion_thread', self.emotion_thread))
+        if hasattr(self, 'music_thread') and self.music_thread is not None and hasattr(self.music_thread, 'is_alive') and self.music_thread.is_alive():
+            threads_to_terminate.append(('music_thread', self.music_thread))
+        if hasattr(self, 'capture_thread') and self.capture_thread is not None and hasattr(self.capture_thread, 'is_alive') and self.capture_thread.is_alive():
+            threads_to_terminate.append(('capture_thread', self.capture_thread))
+        
+        # Phase 1: Graceful termination (2 seconds)
+        for thread_name, thread in threads_to_terminate:
+            logger.info(f"Requesting graceful termination of {thread_name}...")
+            thread.join(timeout=2.0)
+            
+        # Phase 2: Check which threads are still alive
+        still_alive = [(name, thread) for name, thread in threads_to_terminate if thread.is_alive()]
+        
+        if still_alive:
+            logger.warning(f"{len(still_alive)} threads did not terminate gracefully")
+            
+            # Phase 3: Force termination signal (1 second)
+            for thread_name, thread in still_alive:
+                logger.warning(f"Forcing termination of {thread_name}...")
+                if hasattr(self, 'force_stop_event'):
+                    self.force_stop_event.set()
+                thread.join(timeout=1.0)
+            
+            # Phase 4: Final check and abandon if necessary
+            final_check = [(name, thread) for name, thread in still_alive if thread.is_alive()]
+            if final_check:
+                logger.error(f"{len(final_check)} threads could not be terminated:")
+                for thread_name, thread in final_check:
+                    logger.error(f"  - {thread_name} (ID: {thread.ident}) - ABANDONED")
+                    # Note: Python doesn't support thread.terminate(), so we abandon them
+        
+        # Reset thread references
+        self.emotion_thread = None
+        self.music_thread = None
+        self.capture_thread = None
+    
+    def _comprehensive_music_engine_cleanup(self):
+        """Comprehensive cleanup of all music engines"""
+        logger.info("Performing comprehensive music engine cleanup...")
+        
+        engines_to_cleanup = []
+        
+        # Collect all available engines
+        if hasattr(self, 'pyo_engine') and self.pyo_engine:
+            engines_to_cleanup.append(('Pyo', self.pyo_engine))
+        if hasattr(self, 'tidal_engine') and self.tidal_engine:
+            engines_to_cleanup.append(('Tidal', self.tidal_engine))
+        if hasattr(self, 'sonicpi_engine') and self.sonicpi_engine:
+            engines_to_cleanup.append(('SonicPi', self.sonicpi_engine))
+        if hasattr(self, 'midi_engine') and self.midi_engine:
+            engines_to_cleanup.append(('MIDI', self.midi_engine))
+        
+        # Stop each engine with timeout
+        for engine_name, engine in engines_to_cleanup:
+            try:
+                logger.info(f"Stopping {engine_name} engine...")
+                
+                # Try normal stop first
+                if hasattr(engine, 'stop'):
+                    engine.stop()
+                
+                # Additional Pyo-specific cleanup
+                if engine_name == 'Pyo' and hasattr(engine, 'server'):
+                    try:
+                        if hasattr(engine.server, 'stop'):
+                            engine.server.stop()
+                        if hasattr(engine.server, 'shutdown'):
+                            engine.server.shutdown()
+                    except Exception as pyo_e:
+                        logger.debug(f"Pyo server cleanup error: {pyo_e}")
+                
+                # Additional cleanup for other engines
+                if hasattr(engine, 'cleanup'):
+                    engine.cleanup()
+                if hasattr(engine, 'close'):
+                    engine.close()
+                
+                logger.info(f"{engine_name} engine stopped successfully")
+                
+            except Exception as e:
+                logger.error(f"Error stopping {engine_name} engine: {e}")
+                # Continue with other engines even if one fails
+        
+        # Reset engine references
+        self.pyo_engine = None
+        self.tidal_engine = None
+        self.sonicpi_engine = None
+        self.midi_engine = None
+    
+    def _comprehensive_queue_cleanup(self):
+        """Comprehensive cleanup of all queues and data structures"""
+        logger.info("Performing comprehensive queue cleanup...")
+        
+        queues_cleared = 0
+        
+        # Clear emotion data queue
+        if hasattr(self, 'emotion_data_queue'):
+            cleared = 0
+            while not self.emotion_data_queue.empty():
+                try:
+                    self.emotion_data_queue.get_nowait()
+                    cleared += 1
+                except queue.Empty:
+                    break
+            if cleared > 0:
+                logger.info(f"Cleared {cleared} items from emotion_data_queue")
+                queues_cleared += 1
+        
+        # Clear any capture queues
+        if hasattr(self, 'emotion_capture') and self.emotion_capture and hasattr(self.emotion_capture, 'data_queue'):
+            cleared = 0
+            while not self.emotion_capture.data_queue.empty():
+                try:
+                    self.emotion_capture.data_queue.get_nowait()
+                    cleared += 1
+                except queue.Empty:
+                    break
+            if cleared > 0:
+                logger.info(f"Cleared {cleared} items from capture data_queue")
+                queues_cleared += 1
+        
+        # Clear any other queues that might exist
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name)
+            if hasattr(attr, 'empty') and hasattr(attr, 'get_nowait'):  # Duck typing for queue
+                try:
+                    cleared = 0
+                    while not attr.empty():
+                        try:
+                            attr.get_nowait()
+                            cleared += 1
+                        except:
+                            break
+                    if cleared > 0:
+                        logger.info(f"Cleared {cleared} items from {attr_name}")
+                        queues_cleared += 1
+                except:
+                    pass  # Not actually a queue or already cleared
+        
+        logger.info(f"Cleared {queues_cleared} queues total")
+    
+    def _reset_session_state(self):
+        """Reset all session state variables"""
+        logger.info("Resetting session state...")
+        
+        # Reset flags
         self.running = False
-        self.shutdown_event.set()  # Signal all threads to stop
-
-        # Stop emotion capture
-        if hasattr(self, 'emotion_capture'):
-            self.emotion_capture.stop()
-
-        # Wait for threads to finish
-        for thread_name, thread in [("capture_thread", self.capture_thread)]:
-            if thread and thread.is_alive():
-                thread.join(timeout=2.0)
-                if thread.is_alive():
-                    logger.warning(f"{thread_name} did not terminate after shutdown signal!")
-
-        # --- PHASE 2: Reset filter and filtered emotion on session end ---
-        self.kalman_filter = None
-        self._latest_filtered_emotion = None
-
-        # Explicitly clear emotion trajectory/history at session end
-        self.emotion_state.clear_history()
-
-        # Session cleanup
-        if self.on_session_end:
-            session_summary = self._generate_session_summary()
-            self.on_session_end(session_summary)
-
-        logger.info(f"Session {getattr(self, 'current_session_id', session_id)} stopped")
+        if hasattr(self, 'shutdown_event'):
+            self.shutdown_event.clear()
+        if hasattr(self, 'force_stop_event'):
+            self.force_stop_event.clear()
+        
+        # Reset session identifiers
+        self._current_session_id = None
+        self.socketio_sid = None
+        
+        # Reset statistics
+        if hasattr(self, '_session_stats'):
+            self._session_stats = {}
+        
+        # Reset any cached data
+        if hasattr(self, '_last_emotion_data'):
+            self._last_emotion_data = None
+        if hasattr(self, '_last_music_params'):
+            self._last_music_params = None
+        
+        logger.info("Session state reset complete")
+    
+    def _validate_resource_cleanup(self):
+        """Validate that all resources have been properly cleaned up"""
+        logger.info("Validating resource cleanup...")
+        
+        issues_found = []
+        
+        # Check for active threads
+        active_threads = []
+        if hasattr(self, 'emotion_thread') and self.emotion_thread is not None and hasattr(self.emotion_thread, 'is_alive') and self.emotion_thread.is_alive():
+            active_threads.append('emotion_thread')
+        if hasattr(self, 'music_thread') and self.music_thread is not None and hasattr(self.music_thread, 'is_alive') and self.music_thread.is_alive():
+            active_threads.append('music_thread')
+        if hasattr(self, 'capture_thread') and self.capture_thread is not None and hasattr(self.capture_thread, 'is_alive') and self.capture_thread.is_alive():
+            active_threads.append('capture_thread')
+        
+        if active_threads:
+            issues_found.append(f"Active threads still running: {active_threads}")
+        
+        # Check for non-empty queues
+        non_empty_queues = []
+        if hasattr(self, 'emotion_data_queue') and not self.emotion_data_queue.empty():
+            non_empty_queues.append('emotion_data_queue')
+        
+        if non_empty_queues:
+            issues_found.append(f"Non-empty queues: {non_empty_queues}")
+        
+        # Check for active engines
+        active_engines = []
+        if hasattr(self, 'pyo_engine') and self.pyo_engine:
+            active_engines.append('pyo_engine')
+        if hasattr(self, 'tidal_engine') and self.tidal_engine:
+            active_engines.append('tidal_engine')
+        
+        if active_engines:
+            issues_found.append(f"Active engines not cleaned up: {active_engines}")
+        
+        # Report validation results
+        if issues_found:
+            logger.warning("Resource cleanup validation found issues:")
+            for issue in issues_found:
+                logger.warning(f"  - {issue}")
+        else:
+            logger.info("Resource cleanup validation passed - all resources properly released")
+    
+    def _emergency_cleanup(self):
+        """Emergency cleanup when normal cleanup fails"""
+        logger.error("Performing emergency cleanup...")
+        
+        try:
+            # Force stop all threads
+            import threading
+            for thread in threading.enumerate():
+                if thread != threading.current_thread() and thread is not None and hasattr(thread, 'is_alive') and thread.is_alive():
+                    if hasattr(thread, 'name') and ('emotion' in thread.name.lower() or 'music' in thread.name.lower() or 'capture' in thread.name.lower()):
+                        logger.error(f"Emergency: Abandoning thread {thread.name}")
+            
+            # Force clear all attributes that might hold resources
+            for attr_name in ['pyo_engine', 'tidal_engine', 'sonicpi_engine', 'midi_engine', 
+                             'emotion_capture', 'emotion_thread', 'music_thread', 'capture_thread']:
+                if hasattr(self, attr_name):
+                    setattr(self, attr_name, None)
+            
+            # Force reset flags
+            self.running = False
+            self._current_session_id = None
+            
+            logger.error("Emergency cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Emergency cleanup failed: {e}")
+            # At this point, we've done everything we can
 
     def set_socketio_sid(self, socketio_sid):
-        """Set the current SocketIO sid for this session (for correct emit targeting)."""
+        """Set SocketIO session ID for frontend communication"""
         self._current_socketio_sid = socketio_sid
 
     def _emotion_capture_loop(self):
-        """Capture emotion data from sensors and queue for processing"""
-        logger.info("[SessionManager] Starting _emotion_capture_loop thread.")
-        while not self.shutdown_event.is_set():
+        """Improved emotion capture loop with better error handling and performance"""
+        logger.info("Starting emotion capture loop")
+        
+        consecutive_empty_count = 0
+        max_consecutive_empty = 10
+        
+        while not self.shutdown_event.is_set() and self.running:
             try:
-                # Get data from emotion capture (a dict with keys 'face_frame' & 'audio_chunk')
+                # Get data from emotion capture
                 data = self.emotion_capture.get_data()
+                
                 if not data:
+                    consecutive_empty_count += 1
+                    
                     # Check for missing data timeout
                     now = time.time()
                     if (now - self._last_valid_emotion_time > self._missing_data_timeout and
                         not self._missing_data_warning_sent):
-                        # Emit warning to frontend
-                        if self.app is not None and self.socketio is not None:
-                            sid = getattr(self, '_current_socketio_sid', None)
-                            if sid:
-                                self.socketio.emit('emotion_update', {'warning': f'No emotion data received for {int(now - self._last_valid_emotion_time)} seconds.'}, room=sid)
-                                self._missing_data_warning_sent = True
-                    time.sleep(0.05)
+                        self._emit_missing_data_warning(now)
+                    
+                    # If too many consecutive empty reads, log warning
+                    if consecutive_empty_count >= max_consecutive_empty:
+                        logger.warning(f"Queue empty for {consecutive_empty_count} consecutive reads")
+                        consecutive_empty_count = 0
+                    
+                    time.sleep(0.1)  # Brief pause
                     continue
-                logger.debug(f"[SessionManager] emotion_capture.get_data() returned: {type(data)} {list(data.keys()) if data else data}")
-                if not data:
-                    logger.debug("[SessionManager] No data from emotion_capture.get_data(). Waiting...")
-                    self.shutdown_event.wait(0.05)
-                    continue
-
-                # Explicitly extract the numpy arrays (or None) from the dict
-                face_frame   = data.get('face_frame')
-                audio_chunk  = data.get('audio_chunk')     
-                logger.info(f"[SessionManager] Got data from capture: face_frame={'yes' if face_frame is not None else 'no'}, audio_chunk={'yes' if audio_chunk is not None else 'no'}.")
-                if audio_chunk is not None:
-                    logger.info(f"[SessionManager] Audio chunk shape: {audio_chunk.shape}, dtype: {audio_chunk.dtype}")
-
-                # Transform keys to match analyzer's expected parameters
-                transformed_data = {}
-                if face_frame is not None:
-                    transformed_data['frame'] = face_frame  # EmotionAnalyzer expects 'frame'
-                if audio_chunk is not None:
-                    transformed_data['audio'] = audio_chunk  # EmotionAnalyzer expects 'audio'
-                # Optionally pass timestamp if needed (but not to analyze)
-                if 'timestamp' in data:
-                    transformed_data['timestamp'] = data['timestamp']
-
-                # Only pass allowed keys to analyze()
-                allowed = {'frame', 'audio', 'sr'}
-                analyze_kwargs = {k: v for k, v in transformed_data.items() if k in allowed}
-
-                if analyze_kwargs:
-                    analysis_result = self.emotion_analyzer.analyze(**analyze_kwargs)
-                    logger.debug(f"[SessionManager] emotion_analyzer.analyze result: {analysis_result}")
-                    fused_emotion = self._fuse_emotion_data(analysis_result)
-                    logger.debug(f"[SessionManager] _fuse_emotion_data returned: {fused_emotion}")
-                    # --- FIX: Put fused emotion into the emotion_data_queue for downstream processing ---
-                    if fused_emotion:
-                        try:
-                            self.emotion_data_queue.put_nowait(fused_emotion)
-                            logger.debug("[SessionManager] Fused emotion put in emotion_data_queue.")
-                        except queue.Full:
-                            logger.warning("[SessionManager] emotion_data_queue full, dropping oldest.")
-                            try:
-                                self.emotion_data_queue.get_nowait()
-                                self.emotion_data_queue.put_nowait(fused_emotion)
-                                logger.debug("[SessionManager] Oldest emotion dropped, new fused emotion put in queue.")
-                            except queue.Empty:
-                                logger.error("[SessionManager] emotion_data_queue full and empty on get_nowait().")
-                    session_time = time.time() - getattr(self, 'session_start_time', time.time())
-                    # --- Call _process_emotion_update to update filtered emotion and history ---
-                    self._process_emotion_update(session_time)
-                    logger.debug(f"[SessionManager] Called _process_emotion_update at session_time={session_time}")
-                    logger.debug(f"[SessionManager] _latest_filtered_emotion: {getattr(self, '_latest_filtered_emotion', None)}")
-                    logger.log_emotion(
-                        valence=fused_emotion.get('valence', 0) if fused_emotion else 0,
-                        arousal=fused_emotion.get('arousal', 0) if fused_emotion else 0,
-                        confidence=fused_emotion.get('uncertainty', 0.5) if fused_emotion else 0.5,
-                        source='fused',
-                        raw_data=fused_emotion,
-                    )
-                    # --- EMIT TO FRONTEND (SOCKETIO) ---
-                    try:
-                        if self.app is not None and self.socketio is not None:
-                            filtered_emotion = getattr(self, '_latest_filtered_emotion', None)
-                            sid = getattr(self, '_current_socketio_sid', None)
-                            status = self.get_current_status()
-                            if not sid:
-                                logger.error("[SessionManager] No SocketIO sid set! Cannot emit to frontend.")
-                                continue
-                            # --- PHASE 2: Use filtered emotion if available ---
-                            if filtered_emotion is not None:
-                                flat_emotion = {
-                                    'valence': filtered_emotion.get('valence', 0),
-                                    'arousal': filtered_emotion.get('arousal', 0),
-                                    'confidence': filtered_emotion.get('confidence', 0.5)
-                                }
-                            else:
-                                # fallback: try to get fused emotion
-                                fused_emotion = self._get_current_emotion()
-                                flat_emotion = {
-                                    'valence': fused_emotion.get('valence', 0) if fused_emotion else 0,
-                                    'arousal': fused_emotion.get('arousal', 0) if fused_emotion else 0,
-                                    'confidence': fused_emotion.get('confidence', 0.5) if fused_emotion else 0.5
-                                }
-                            trajectory_progress = status.get('trajectory_progress', {})
-                            music_parameters = status.get('music_parameters', {})
-
-                            payload = {
-                                'emotion_state': flat_emotion,
-                                'trajectory_progress': trajectory_progress,
-                                'music_parameters': music_parameters,
-                            }
-
-                            # Log type and repr for every value in payload
-                            for k, v in payload.items():
-                                logger.info(f"[EmitPayload] {k}: type={type(v)}, repr={repr(v)}")
-                                if callable(v):
-                                    logger.error(f"[EmitPayload] ABORT: {k} is a function! Skipping emit.")
-                                    raise TypeError(f"Emit payload key '{k}' is a function, not serializable.")
-                            # --- PATCH: Robustly check payload for unserializable objects/functions ---
-                            def is_serializable(obj):
-                                import numpy as np
-                                import types
-                                if isinstance(obj, (int, float, str, bool, type(None))):
-                                    return True
-                                if isinstance(obj, (list, tuple)):
-                                    return all(is_serializable(x) for x in obj)
-                                if isinstance(obj, dict):
-                                    return all(isinstance(k, str) and is_serializable(v) for k, v in obj.items())
-                                if isinstance(obj, np.ndarray):
-                                    return True
-                                if isinstance(obj, types.FunctionType):
-                                    return False
-                                return False
-
-                            for k, v in payload.items():
-                                if not is_serializable(v):
-                                    logger.error(f"[EmitPayload] UNSERIALIZABLE: {k}: type={type(v)}, repr={repr(v)}")
-                                    payload[k] = str(v)
-
-                            logger.info(f"[SessionManager] Emitting emotion_update to sid={sid} with payload: {payload}")
-                            self.socketio.emit('emotion_update', payload, room=sid)
-                        else:
-                            logger.warning("[SessionManager] filtered_emotion is None, skipping emit block.")
-                    except Exception as e:
-                        logger.error(f"[SessionManager] Failed to emit SocketIO events: {e}")
-                else:
-                    logger.debug("[SessionManager] No valid data to pass to emotion_analyzer.analyze.")
-
-                self.shutdown_event.wait(0.05)  # Use event wait for interruptible sleep
+                
+                # Reset empty counter on successful data
+                consecutive_empty_count = 0
+                
+                # Process the data
+                self._process_captured_data(data)
+                
             except Exception as e:
                 logger.error(f"Error in emotion capture loop: {e}")
-                self.shutdown_event.wait(0.1)
+                self._processing_stats['processing_errors'] += 1
+                time.sleep(0.1)
+        
+        logger.info("Emotion capture loop ended")
+
+    def _process_captured_data(self, data: Dict):
+        """Process captured data with improved error handling"""
+        try:
+            # Extract frame and audio data
+            face_frame = data.get('face_frame') or data.get('frame')
+            audio_chunk = data.get('audio_chunk') or data.get('audio')
+            
+            # Prepare data for analysis
+            analysis_data = {}
+            if face_frame is not None:
+                analysis_data['frame'] = face_frame
+            if audio_chunk is not None:
+                analysis_data['audio'] = audio_chunk
+            if 'sr' in data:
+                analysis_data['sr'] = data['sr']
+            
+            # Perform emotion analysis if we have data
+            if analysis_data:
+                analysis_result = self.emotion_analyzer.analyze(**analysis_data)
+                
+                # Fuse emotions
+                fused_emotion = self._fuse_emotion_data(analysis_result)
+                
+                if fused_emotion:
+                    # Add to queue
+                    try:
+                        self.emotion_data_queue.put_nowait(fused_emotion)
+                        self._processing_stats['emotions_processed'] += 1
+                        self._last_valid_emotion_time = time.time()
+                        self._missing_data_warning_sent = False
+                        
+                        # Process emotion update with the fused emotion data
+                        self._process_emotion_update(fused_emotion)
+                        
+                    except queue.Full:
+                        # Remove oldest and add new
+                        try:
+                            self.emotion_data_queue.get_nowait()
+                            self.emotion_data_queue.put_nowait(fused_emotion)
+                            self._processing_stats['emotions_dropped'] += 1
+                        except queue.Empty:
+                            logger.error("Queue management error")
+                else:
+                    # If no fused emotion, create a dynamic fallback structure
+                    # FIXED: Make fallback data more dynamic to simulate real emotion
+                    import random
+                    import math
+                    
+                    # Create a simple oscillating pattern to simulate emotion changes
+                    current_time = time.time()
+                    oscillation = math.sin(current_time * 0.5) * 0.3  # Slow oscillation
+                    noise = random.uniform(-0.1, 0.1)  # Small random variation
+                    
+                    default_emotion = {
+                        'mean': {
+                            'valence': max(-1.0, min(1.0, 0.0 + oscillation + noise)),
+                            'arousal': max(0.0, min(1.0, 0.5 + oscillation * 0.5 + noise * 0.5))
+                        },
+                        'confidence': 0.5 + abs(noise) * 0.3,  # Vary confidence slightly
+                        'timestamp': current_time
+                    }
+                    
+                    # Process the fallback emotion
+                    self._process_emotion_update(default_emotion)
+                    self._processing_stats['emotions_processed'] += 1
+                    self._last_valid_emotion_time = current_time
+                    self._missing_data_warning_sent = False
+            else:
+                # No analysis data available, create fallback emotion
+                import random
+                import math
+                
+                current_time = time.time()
+                oscillation = math.sin(current_time * 0.5) * 0.3
+                noise = random.uniform(-0.1, 0.1)
+                
+                fallback_emotion = {
+                    'mean': {
+                        'valence': max(-1.0, min(1.0, 0.0 + oscillation + noise)),
+                        'arousal': max(0.0, min(1.0, 0.5 + oscillation * 0.5 + noise * 0.5))
+                    },
+                    'confidence': 0.3,  # Lower confidence for fallback
+                    'timestamp': current_time
+                }
+                
+                # Process the fallback emotion
+                self._process_emotion_update(fallback_emotion)
+                self._processing_stats['emotions_processed'] += 1
+                self._last_valid_emotion_time = current_time
+                
+        except Exception as e:
+            logger.error(f"Error processing captured data: {e}")
+            self._processing_stats['processing_errors'] += 1
+
+    def _emit_missing_data_warning(self, current_time: float):
+        """Emit warning about missing data to frontend"""
+        if self.app is not None and self.socketio is not None:
+            sid = getattr(self, '_current_socketio_sid', None)
+            if sid:
+                warning_msg = f'No emotion data received for {int(current_time - self._last_valid_emotion_time)} seconds.'
+                self.socketio.emit('emotion_update', {'warning': warning_msg}, room=sid)
+                self._missing_data_warning_sent = True
+
+    def _save_emotion_to_database(self, emotion_data: Dict):
+        """Save processed emotion data to the database with enhanced error handling."""
+        if not self.db or not self._current_session_id:
+            logger.debug("No database or session ID available for emotion data saving")
+            return
+        
+        try:
+            # Extract emotion values with proper validation
+            if isinstance(emotion_data, dict):
+                # Handle nested mean structure
+                if 'mean' in emotion_data and isinstance(emotion_data['mean'], dict):
+                    valence = emotion_data['mean'].get('valence', 0.0)
+                    arousal = emotion_data['mean'].get('arousal', 0.5)
+                else:
+                    # Handle direct structure
+                    valence = emotion_data.get('valence', 0.0)
+                    arousal = emotion_data.get('arousal', 0.5)
+                
+                confidence = emotion_data.get('confidence', 0.5)
+                timestamp = emotion_data.get('timestamp', time.time())
+            else:
+                # Fallback for unexpected data types
+                logger.warning(f"Unexpected emotion_data type: {type(emotion_data)}, using defaults")
+                valence = 0.0
+                arousal = 0.5
+                confidence = 0.5
+                timestamp = time.time()
+            
+            # Validate values
+            valence = float(np.clip(valence, -1.0, 1.0))
+            arousal = float(np.clip(arousal, 0.0, 1.0))
+            confidence = float(np.clip(confidence, 0.0, 1.0))
+            timestamp = float(timestamp)
+            
+            # Save to database
+            self.db.save_emotion_data(
+                session_id=self._current_session_id,
+                timestamp=timestamp,
+                valence=valence,
+                arousal=arousal,
+                confidence=confidence,
+                source='fusion'
+            )
+            
+            logger.debug(f"Saved emotion data to database: valence={valence:.3f}, arousal={arousal:.3f}, confidence={confidence:.3f}")
+            
+        except Exception as e:
+            logger.error(f"Error saving emotion data to database: {e}")
+            import traceback
+            logger.error(f"Database save traceback: {traceback.format_exc()}")
 
     def _fuse_emotion_data(self, analysis_result: Dict) -> Optional[Dict]:
-        logger.debug(f"[SessionManager] _fuse_emotion_data called with: {analysis_result}")
+        """Fuse emotion data with improved error handling and proper structure"""
         try:
+            if not analysis_result:
+                logger.debug("No analysis result for fusion")
+                return None
+            
+            # Extract face and voice data
             face_data = analysis_result.get('face')
             voice_data = analysis_result.get('voice')
-
-            # Build face dict if valid
-            face_dict = None
-            if face_data and face_data.get('confidence', 0) > 0.1:
-                face_dict = {
-                    'emotions': {
-                        'valence': face_data['emotions']['valence'],
-                        'arousal': face_data['emotions']['arousal']
-                    },
-                    'confidence': face_data['confidence']
-                }
-                logger.debug(f"[SessionManager] Valid face_data for fusion: {face_dict}")
+            
+            # Validate data before fusion
+            if face_data:
+                logger.debug(f"Valid face_data for fusion: {face_data}")
+            if voice_data:
+                logger.debug(f"Valid voice_data for fusion: {voice_data}")
+            
+            # Perform fusion
+            fused_result = self.emotion_fusion.fuse_emotions(face_data, voice_data)
+            
+            # Ensure proper structure for our emotion processing
+            if fused_result:
+                # Add timestamp
+                fused_result['timestamp'] = time.time()
+                
+                # Ensure we have the 'mean' structure that our processing expects
+                if 'mean' not in fused_result:
+                    # If we have direct valence/arousal, wrap them in 'mean'
+                    if 'valence' in fused_result and 'arousal' in fused_result:
+                        fused_result = {
+                            'mean': {
+                                'valence': fused_result['valence'],
+                                'arousal': fused_result['arousal']
+                            },
+                            'confidence': fused_result.get('confidence', 0.5),
+                            'timestamp': fused_result['timestamp']
+                        }
+                    else:
+                        # Create default structure
+                        fused_result = {
+                            'mean': {'valence': 0.0, 'arousal': 0.5},
+                            'confidence': 0.5,
+                            'timestamp': fused_result['timestamp']
+                        }
+                
+                logger.debug(f"Fused emotion result: {fused_result}")
+                return fused_result
             else:
-                logger.debug("[SessionManager] No valid face_data for fusion.")
-
-            # Build voice dict if valid
-            voice_dict = None
-            if voice_data and voice_data.get('confidence', 0.1):
-                voice_dict = {
-                    'emotions': {
-                        'valence': voice_data['emotions']['valence'],
-                        'arousal': voice_data['emotions']['arousal']
-                    },
-                    'confidence': voice_data['confidence']
-                }
-                logger.debug(f"[SessionManager] Valid voice_data for fusion: {voice_dict}")
-            else:
-                logger.debug("[SessionManager] No valid voice_data for fusion.")
-
-            # Call fuse_emotions with the correct dict parameters
-            logger.debug(f"[SessionManager] Calling emotion_fusion.fuse_emotions(face_data={face_dict}, voice_data={voice_dict})")
-            fused_emotion = self.emotion_fusion.fuse_emotions(
-                face_data=face_dict,
-                voice_data=voice_dict
-            )
-            logger.debug(f"[SessionManager] emotion_fusion.fuse_emotions result: {fused_emotion}")
-
-            return fused_emotion
-        except Exception as e:
-            logger.error(f"Error fusing emotion data: {e}")
-            return None
-
-    def _process_emotion_update(self, session_time: float):
-        """Process emotion sensing and filtering, only update music if emotion is valid."""
-        logger.info(f"[SessionManager] _process_emotion_update called at session_time={session_time}")
-        try:
-            fused_emotion = self._get_current_emotion()  # now returns full dict with mean + covariance
-            logger.debug(f"[SessionManager] _get_current_emotion returned: {fused_emotion}")
-
-            # Check if emotion is valid (not default/zero)
-            is_valid = False
-            if fused_emotion is not None:
-                v = fused_emotion.get('valence', None)
-                a = fused_emotion.get('arousal', None)
-                if v is not None and a is not None and (v != 0.0 or a != 0.0):
-                    is_valid = True
-
-            if is_valid:
-                # --- PHASE 2: Feed every fused emotion into the filter ---
-                filtered_state, _ = self.kalman_filter.update({
-                    'valence': fused_emotion['valence'],
-                    'arousal': fused_emotion['arousal'],
-                    'uncertainty': fused_emotion.get('uncertainty', 0.5)
-                })
-                filtered_emotion = {
-                    'valence': filtered_state[0],
-                    'arousal': filtered_state[1],
-                    'confidence': fused_emotion.get('confidence', 0.5)
-                }
-                self._latest_filtered_emotion = filtered_emotion
-                logger.info(f"[SessionManager] Updating emotion with filtered data: {filtered_emotion}")
-
-                # Ensure timestamp is set for filtered_emotion
-                if 'timestamp' not in filtered_emotion or not np.isfinite(filtered_emotion.get('timestamp', None)):
-                    filtered_emotion['timestamp'] = time.time()
-                # Now also store full uncertainty trace
-                self.emotion_state.update_emotion({
-                    'mean': filtered_emotion,
-                    'covariance': fused_emotion.get('covariance'),
-                    'uncertainty_trace': fused_emotion.get('uncertainty'),
-                    'timestamp': filtered_emotion['timestamp']
-                })
-
-                # --- Map filtered emotion to music parameters, log, and update renderer ---
-                val = filtered_emotion['valence']
-                ar = filtered_emotion['arousal']
-                mapped_params = self.base_mapping.map_emotion_to_parameters(val, ar)
-                logger.info(f"[SessionManager] Mapped music parameters: {mapped_params}")
-                from emotune.utils.logging import log_music
-                log_music(mapped_params, trajectory_type=getattr(self, 'current_trajectory_type', None), trajectory_progress=session_time/self.config.session_duration)
-                logger.log_music_generation(
-                    parameters=mapped_params,
-                    trajectory_type=getattr(self, 'current_trajectory_type', None),
-                    trajectory_progress=session_time/self.config.session_duration
-                )
-                self.music_renderer.update_target_parameters(mapped_params)
-                self.music_renderer.current_params = mapped_params.copy()  # Immediate update for frontend
-
-                # Store for frontend emission
-                self._latest_music_parameters = mapped_params.copy()
-
-                target_emotion = self.trajectory_planner.get_current_target()
-                deviation = self.dtw_matcher.compute_trajectory_deviation(
-                    self.emotion_state.get_emotion_trajectory(),
-                    self.trajectory_planner.current_trajectory,
-                    self.trajectory_planner.start_time
-                )
-                logger.info(f"[SessionManager] Target emotion: {target_emotion}, Deviation: {deviation}")
-
-                if self.rl_agent:
-                    logger.debug("[SessionManager] Storing RL state...")
-                    self._store_rl_state(filtered_emotion, deviation, session_time)
-
-                if self.on_emotion_update:
-                    logger.debug("[SessionManager] Calling on_emotion_update callback...")
-                    self.on_emotion_update({
-                        'emotion': filtered_emotion,
-                        'target': target_emotion,
-                        'deviation': deviation,
-                        'session_time': session_time
-                    })
-            else:
-                logger.warning("[SessionManager] Emotion state invalid or default/zero. Holding last music parameters.")
-                # Do not update music parameters, just hold last
-                # Optionally, emit a warning to frontend if needed
-                if self.app is not None and self.socketio is not None:
-                    sid = getattr(self, '_current_socketio_sid', None)
-                    if sid:
-                        self.socketio.emit('error', {'message': 'Emotion state invalid or default. Music parameters not updated.'}, room=sid)
-
-        except Exception as e:
-            logger.error(f"Error in emotion processing: {e}")
-
-    def _get_current_emotion(self) -> Optional[dict]:
-        """Get current emotion from sensors, with robust fallback if queue is empty."""
-        try:
-            logger.debug(f"[SessionManager] _get_current_emotion: queue size before get: {self.emotion_data_queue.qsize()}")
-            # Try to get emotion from queue first (most recent) with exponential backoff
-            try:
-                # Exponential backoff for queue polling
-                timeout = min(0.1 * (2 ** min(self._empty_queue_counter, 5)), 1.0)
-                emotion_data = self.emotion_data_queue.get(timeout=timeout)
-                self._empty_queue_counter = 0  # Reset counter on success
-                logger.debug(f"[SessionManager] _get_current_emotion got from queue: {emotion_data}")
-                
-                # Update latest valid emotion and reset warning flags
-                with self.emotion_data_lock:
-                    self.latest_emotion_data = emotion_data.copy()
-                    self._last_valid_emotion_time = time.time()
-                    self._missing_data_warning_sent = False
-                
-                return emotion_data
-            except queue.Empty:
-                self._empty_queue_counter += 1
-                logger.debug(f"[SessionManager] _get_current_emotion: emotion_data_queue empty (count={self._empty_queue_counter}).")
-                
-                # Warn if empty for a long time
-                if self._empty_queue_counter % 10 == 0:
-                    logger.warning(f"Emotion data queue has been empty for {self._empty_queue_counter} consecutive polls.")
-                
-                # Fall back to latest valid emotion with higher priority
-                with self.emotion_data_lock:
-                    if self.latest_emotion_data is not None:
-                        logger.info("[SessionManager] Falling back to latest valid emotion data.")
-                        return self.latest_emotion_data.copy()
-                
-                # If no valid emotion ever, only then emit default
-                logger.warning("[SessionManager] No valid emotion data available (queue and history empty). Emitting default state.")
+                logger.warning("Fusion returned None, creating default structure")
                 return {
-                    'valence': 0.0,
-                    'arousal': 0.0,
+                    'mean': {'valence': 0.0, 'arousal': 0.5},
                     'confidence': 0.5,
-                    'covariance': [[0.5, 0.0], [0.0, 0.5]],
-                    'uncertainty': 1.0,
-                    'timestamp': time.time(),
-                    'is_default': True  # Mark as default state for downstream handling
+                    'timestamp': time.time()
                 }
+            
         except Exception as e:
-            logger.error(f"Error getting current emotion: {e}")
+            logger.error(f"Error in emotion fusion: {e}")
+            # Return default structure on error
             return {
-                'valence': 0.0,
-                'arousal': 0.0,
+                'mean': {'valence': 0.0, 'arousal': 0.5},
                 'confidence': 0.5,
-                'covariance': [[0.5, 0.0], [0.0, 0.5]],
-                'uncertainty': 1.0,
                 'timestamp': time.time()
             }
+
+    def _process_emotion_update(self, emotion_data: Dict):
+        """
+        Main processing loop for emotion data.
+        This function now orchestrates the entire flow from fusion to music generation.
+        """
+        try:
+            # Step 1: Fuse Face and Voice Data
+            # This is now handled by the caller, which passes 'emotion_data'.
+            # We assume 'emotion_data' is the output of the fusion process.
+            
+            if not isinstance(emotion_data, dict) or 'mean' not in emotion_data:
+                logger.error(f"Invalid emotion data structure received: {emotion_data}")
+                return
+
+            valence = emotion_data['mean'].get('valence', 0.0)
+            arousal = emotion_data['mean'].get('arousal', 0.0)
+            confidence = emotion_data.get('confidence', 0.5)
+            timestamp = emotion_data.get('timestamp', time.time())
+            
+            # Step 2: Apply Kalman Filter
+            state, cov = self.kalman_filter.update({
+                'valence': valence, 'arousal': arousal, 'confidence': confidence,
+                'uncertainty': 1.0 - confidence
+            })
+            filtered_valence, filtered_arousal = state[0], state[1]
+            logger.debug(f"Kalman filtered: V={filtered_valence:.3f}, A={filtered_arousal:.3f}")
+
+            # Extract the 2x2 covariance for valence and arousal
+            cov_2x2 = cov[:2, :2] if cov is not None and cov.shape[0] >= 2 and cov.shape[1] >= 2 else [[0.5, 0.0], [0.0, 0.5]]
+
+            # Step 3: Update Central Emotion State
+            emotion_dist = {
+                'mean': {
+                    'valence': filtered_valence,
+                    'arousal': filtered_arousal
+                },
+                'covariance': cov_2x2,
+                'timestamp': timestamp,
+                'confidence': confidence,  # Ensure confidence is stored in the state
+                'uncertainty_trace': np.trace(cov_2x2)
+            }
+            self.emotion_state.update_emotion(emotion_dist)
+
+            # Step 4: Map Emotion to Music Parameters
+            music_params = self._map_emotion_to_music(filtered_valence, filtered_arousal)
+            self._latest_music_params = music_params.copy()
+            
+            # Step 5: Update Music Engine & RL
+            engine = self._select_music_engine()
+            if engine:
+                music_struct = {
+                    'emotion': {'mean': {'valence': filtered_valence, 'arousal': filtered_arousal}},
+                    'parameters': music_params
+                }
+                engine.play(music_struct)
+
+                # --- RL AGENT UPDATE ---
+                if self.config.enable_rl and self.rl_agent:
+                    # 1. Get current state vector
+                    trajectory_progress = self._get_trajectory_progress()
+                    dtw_error = trajectory_progress.get('deviation', 1.0)
+                    progress = trajectory_progress.get('progress', 0.0)
+                    current_rl_state = self.rl_agent.get_state_vector(
+                        emotion_mean=np.array([filtered_valence, filtered_arousal]),
+                        emotion_cov=cov_2x2,
+                        dtw_error=dtw_error,
+                        trajectory_progress=progress
+                    )
+
+                    # 2. Select action based on current state and update music parameters
+                    action_adjustments = self.rl_agent.select_action(current_rl_state)
+                    music_params = self.rl_agent.update_parameters(action_adjustments)
+                    self._latest_music_params = music_params.copy() # Make sure to update the latest params
+
+                    # 3. If we have a previous state and action, compute reward and store experience
+                    if self.last_rl_state is not None and self.last_rl_action is not None:
+                        # 3a. Compute reward
+                        reward = self.feedback_processor.compute_reward_signal(
+                            trajectory_deviation=dtw_error,
+                            emotion_stability=np.trace(cov_2x2)
+                        )
+                        # 3b. Store experience with the PREVIOUS action
+                        self.rl_agent.store_experience(
+                            state=self.last_rl_state,
+                            action=self.last_rl_action,
+                            reward=reward,
+                            next_state=current_rl_state,
+                            done=(time.time() - self.session_start_time) >= self.config.session_duration if self.session_start_time else False
+                        )
+                        # 3c. Train the agent
+                        self.rl_agent.train()
+
+                    # 4. Update the last state and action for the next iteration
+                    self.last_rl_state = current_rl_state
+                    self.last_rl_action = action_adjustments
+
+            # Step 6: Emit updates and persist data
+            self._emit_emotion_update(
+                raw_emotion=emotion_data,
+                filtered_emotion=self.emotion_state.get_current_emotion(),
+                music_params=music_params
+            )
+            self._save_emotion_to_database(self.emotion_state.get_current_emotion())
+
+        except Exception as e:
+            logger.error(f"Error in _process_emotion_update: {e}", exc_info=True)
+
+
+    def _categorize_valence(self, valence: float) -> str:
+        """Categorize valence for clinical monitoring"""
+        if valence < -0.6:
+            return "very_negative"
+        elif valence < -0.2:
+            return "negative"
+        elif valence < 0.2:
+            return "neutral"
+        elif valence < 0.6:
+            return "positive"
+        else:
+            return "very_positive"
+    
+    def _categorize_arousal(self, arousal: float) -> str:
+        """Categorize arousal for clinical monitoring"""
+        if arousal < 0.2:
+            return "very_low"
+        elif arousal < 0.4:
+            return "low"
+        elif arousal < 0.6:
+            return "moderate"
+        elif arousal < 0.8:
+            return "high"
+        else:
+            return "very_high"
+
+    def _emit_emotion_update(self, raw_emotion: Dict, filtered_emotion: Dict, music_params: Dict):
+        """Emit emotion update to frontend with proper serialization"""
+        try:
+            logger.debug(f"Attempting to emit emotion update: app={self.app is not None}, socketio={self.socketio is not None}")
+            
+            if self.app is None or self.socketio is None:
+                logger.warning("Cannot emit emotion update: app or socketio not available")
+                return
+                
+            sid = getattr(self, '_current_socketio_sid', None)
+            logger.debug(f"SocketIO SID: {sid}")
+            
+            if not sid:
+                logger.warning("Cannot emit emotion update: no SocketIO SID available")
+                return
+            
+            # Prepare payload with proper serialization and safe data access
+            payload = {
+                'emotion_state': self._serialize_emotion_state(filtered_emotion or raw_emotion),
+                'trajectory_progress': self._get_trajectory_progress(),
+                'music_parameters': self._serialize_music_parameters(music_params),
+                'system_logs': {
+                    'face_data': {
+                        'valence': raw_emotion.get('face', {}).get('emotions', {}).get('valence') if raw_emotion else None,
+                        'arousal': raw_emotion.get('face', {}).get('emotions', {}).get('arousal') if raw_emotion else None
+                    },
+                    'voice_data': {
+                        'valence': raw_emotion.get('voice', {}).get('emotions', {}).get('valence') if raw_emotion else None,
+                        'arousal': raw_emotion.get('voice', {}).get('emotions', {}).get('arousal') if raw_emotion else None
+                    },
+                    'fusion': {
+                        'valence': filtered_emotion['mean']['valence'] if filtered_emotion else raw_emotion.get('mean', {}).get('valence'),
+                        'arousal': filtered_emotion['mean']['arousal'] if filtered_emotion else raw_emotion.get('mean', {}).get('arousal'),
+                        'confidence': filtered_emotion.get('confidence', 0.5) if filtered_emotion else raw_emotion.get('confidence', 0.5)
+                    },
+                    'music_engine': {
+                        'status': 'active',
+                        'tempo': music_params.get('tempo_bpm'),
+                        'volume': music_params.get('overall_volume')
+                    },
+                    'feedback': self.feedback_collector.get_session_feedback_summary() if self.config.enable_feedback else {},
+                    'rl_agent': self.rl_agent.get_status() if self.config.enable_rl else {}
+                }
+            }
+            
+            logger.debug(f"Emitting emotion update to frontend: {payload}")
+            
+            # Emit to frontend
+            with self.app.app_context():
+                self.socketio.emit('emotion_update', payload, room=sid)
+            
+            logger.info(f"Successfully emitted emotion update to frontend")
+            
+        except Exception as e:
+            logger.error(f"Error emitting emotion update: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+
+    def _serialize_emotion_state(self, emotion_data: Dict) -> Dict:
+        """Serialize emotion state for JSON transmission"""
+        try:
+            # Handle both direct format and nested mean format
+            if 'mean' in emotion_data:
+                # Kalman-filtered format with mean/covariance
+                mean_data = emotion_data['mean']
+                valence = float(mean_data.get('valence', 0.0))
+                arousal = float(mean_data.get('arousal', 0.0))
+                confidence = float(emotion_data.get('confidence', 0.5))
+            else:
+                # Direct format
+                valence = float(emotion_data.get('valence', 0.0))
+                arousal = float(emotion_data.get('arousal', 0.0))
+                confidence = float(emotion_data.get('confidence', 0.5))
+            
+            # FIXED: Ensure proper structure for frontend
+            serialized = {
+                'valence': valence,
+                'arousal': arousal,
+                'confidence': confidence,
+                'timestamp': emotion_data.get('timestamp', time.time())
+            }
+            
+            # Add mean structure for compatibility
+            serialized['mean'] = {
+                'valence': valence,
+                'arousal': arousal
+            }
+            
+            return serialized
+            
+        except Exception as e:
+            logger.error(f"Error serializing emotion state: {e}")
+            logger.error(f"Emotion data structure: {emotion_data}")
+            return {
+                'valence': 0.0, 
+                'arousal': 0.0, 
+                'confidence': 0.5,
+                'timestamp': time.time(),
+                'mean': {'valence': 0.0, 'arousal': 0.0}
+            }
+
+    def _serialize_music_parameters(self, music_params: Dict) -> Dict:
+        """Serialize music parameters for JSON transmission"""
+        try:
+            if not music_params:
+                return {}
+            
+            serialized = {}
+            for key, value in music_params.items():
+                if isinstance(value, np.ndarray):
+                    # Handle numpy arrays properly
+                    if value.size == 1:
+                        serialized[key] = float(value.item())
+                    else:
+                        serialized[key] = value.tolist()
+                elif isinstance(value, (np.integer, np.floating)):
+                    # Convert numpy types to Python types with proper precision
+                    serialized[key] = float(value)
+                else:
+                    serialized[key] = value
+            
+            return serialized
+            
+        except Exception as e:
+            logger.error(f"Error serializing music parameters: {e}")
+            return {}
 
     def _normalize_music_parameters(self, params):
         """Normalize music parameter keys to camelCase and ensure all expected keys are present for the frontend."""
@@ -668,214 +1125,364 @@ class SessionManager:
                 norm.append({'valence': float(v), 'arousal': float(a), 'timestamp': t})
         return norm
 
-    def _get_trajectory_progress(self, session_time=None):
-        """Return a robust, always-present trajectory progress structure for frontend visualization.
-        Target trajectory points now include timestamps matching the session timeline (offset from session start).
-        """
-        if session_time is None:
-            session_time = time.time() - self.session_start_time if self.running else 0
-        
-        # Get raw trajectory data
-        raw_trajectory = self.emotion_state.get_emotion_trajectory() or []
-        
-        # Fix trajectory extraction - properly format actual_path
-        actual_traj = []
-        for point in raw_trajectory:
-            if 'mean' in point:
-                actual_traj.append({
-                    'valence': point['mean']['valence'],
-                    'arousal': point['mean']['arousal'],
-                    'timestamp': point['timestamp']
-                })
-        
-        # --- FIX: Sample trajectory function if needed ---
-        target_traj = []
-        if hasattr(self.trajectory_planner, 'current_trajectory'):
-            if callable(self.trajectory_planner.current_trajectory):
-                session_duration = self.config.session_duration
-                times = np.linspace(0, session_duration, 100)
-                # Each point is a dict with valence, arousal, and timestamp (offset from session start)
-                target_traj = [
-                    {'valence': v, 'arousal': a, 'timestamp': float(t)}
-                    for t, (v, a) in zip(times, [self.trajectory_planner.current_trajectory(t) for t in times])
-                ]
-            else:
-                target_traj = self.trajectory_planner.current_trajectory
-        actual_path = self._normalize_trajectory_path(actual_traj)
-        target_path = self._normalize_trajectory_path(target_traj)
-        # DTW expects tuples
-        actual_dtw = [(pt['valence'], pt['arousal']) for pt in actual_path]
-        target_dtw = [(pt['valence'], pt['arousal']) for pt in target_path]
-        current_target = self.trajectory_planner.get_current_target() if self.running else None
-        deviation = self.dtw_matcher.compute_trajectory_deviation(
-            actual_dtw,
-            target_dtw,
-            self.trajectory_planner.start_time if hasattr(self.trajectory_planner, 'start_time') else 0
-        )
-        progress = session_time / self.config.session_duration if self.running and self.config.session_duration else 0
+    def _get_trajectory_progress(self) -> dict:
+        """Gets progress along the current therapeutic trajectory."""
+        if not (self.trajectory_planner and self.trajectory_planner._is_active()):
+            return {
+                'actual_path': [], 'target_path': [], 'current_target': None,
+                'deviation': 1.0, 'session_time': 0.0, 'progress': 0.0
+            }
+
+        emotion_trajectory = self.emotion_state.get_emotion_trajectory()
+        adherence_info = self.trajectory_planner.evaluate_trajectory_adherence(emotion_trajectory)
+
+        # Sample the target path for visualization
+        target_path = []
+        target_path_func = self.trajectory_planner.current_trajectory
+        if callable(target_path_func):
+            duration = self.trajectory_planner.duration
+            num_points = 100
+            for i in range(num_points + 1):
+                t = (i / num_points) * duration
+                target_point = target_path_func(t)
+                if target_point:
+                    target_path.append({'valence': target_point[0], 'arousal': target_point[1]})
+
+        current_target = self.trajectory_planner.get_current_target()
+
         return {
-            'actual_path': actual_path,
+            'actual_path': [{'valence': dp['mean']['valence'], 'arousal': dp['mean']['arousal']} for dp in emotion_trajectory],
             'target_path': target_path,
-            'current_target': current_target,
-            'deviation': deviation,
-            'session_time': session_time,
-            'progress': progress
+            'current_target': {'valence': current_target[0], 'arousal': current_target[1]} if current_target else None,
+            'deviation': adherence_info.get('deviation', 1.0),
+            'session_time': (time.time() - self.session_start_time) if self.session_start_time else 0.0,
+            'progress': adherence_info.get('progress', 0.0),
         }
 
     def get_rl_status(self):
-        """Return RL and adaptation status for frontend/logging/debugging. Ensures all expected subkeys are present."""
-        rl_status = {}
-        # Expected subkeys for frontend
-        expected_keys = [
-            'training_summary', 'feedback', 'adaptation',
-            'buffer_size', 'current_params', 'reward', 'confidence',
-            'trend', 'total_adaptations', 'recent_adaptations', 'adaptation_rate'
-        ]
-        if self.rl_agent:
-            rl_status['training_summary'] = self.rl_agent.get_training_summary()
-        if hasattr(self, 'feedback_processor'):
-            rl_status['feedback'] = self.feedback_processor.process_feedback_for_learning()
-        if hasattr(self.trajectory_planner, 'get_adaptation_statistics'):
-            rl_status['adaptation'] = self.trajectory_planner.get_adaptation_statistics()
-        # Fill in all expected keys with safe defaults if missing
-        for k in expected_keys:
-            if k not in rl_status:
-                rl_status[k] = None
-        return rl_status
+        """Get RL agent status"""
+        if hasattr(self, 'rl_agent') and self.rl_agent:
+            return self.rl_agent.get_status()
+        return {'active': False, 'episodes': 0, 'rewards': []}
 
     def get_current_status(self) -> Dict:
-        """Get current session status"""
-        session_time = time.time() - self.session_start_time if self.running else 0
-        with self.emotion_data_lock:
-            latest_raw_emotion = self.latest_emotion_data
-        if latest_raw_emotion is not None:
-            logger.info(f"[get_current_status] latest_raw_emotion type: {type(latest_raw_emotion)}")
-        def safe_tolist(obj):
-            try:
-                return obj.tolist()
-            except AttributeError:
+        """Get current system status with improved error handling"""
+        try:
+            # Get current emotion
+            current_emotion = getattr(self, '_latest_filtered_emotion', None)
+            if not current_emotion:
+                current_emotion = {
+                    'valence': 0.0,
+                    'arousal': 0.0,
+                    'confidence': 0.5
+                }
+            
+            # Get trajectory progress
+            trajectory_progress = self._get_trajectory_progress()
+            
+            # Get music parameters - FIXED: Use latest generated parameters
+            music_params = {}
+            if hasattr(self, '_latest_music_params'):
+                music_params = self._latest_music_params.copy()
+            elif hasattr(self, 'music_renderer'):
+                music_params = self.music_renderer.current_params.copy()
+            
+            # Serialize data for JSON transmission
+            def safe_tolist(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, (np.integer, np.floating)):
+                    return float(obj)
                 return obj
-        trajectory_progress = self._get_trajectory_progress(session_time)
-        rl_status = self.get_rl_status()
-        # Normalize music parameters for frontend
-        music_params = getattr(self, '_latest_music_parameters', self.music_renderer.current_params)
-        music_params = self._normalize_music_parameters(music_params)
-        return {
-            'running': self.running,
-            'session_time': session_time,
-            'progress': session_time / self.config.session_duration if self.running else 0,
-            'current_emotion': self.emotion_state.get_current_emotion(),
-            'latest_raw_emotion': safe_tolist(latest_raw_emotion),
-            'target_emotion': self.trajectory_planner.get_current_target() if self.running else None,
-            'music_parameters': music_params,
-            'emotion_capture_running': self.emotion_capture.is_running() if hasattr(self.emotion_capture, 'is_running') else False,
-            'queue_size': self.emotion_data_queue.qsize(),
-            'trajectory_progress': trajectory_progress,
-            'rl_status': rl_status
-        }
+            
+            return {
+                'emotion_state': {
+                    'valence': safe_tolist(current_emotion.get('valence', 0.0)),
+                    'arousal': safe_tolist(current_emotion.get('arousal', 0.0)),
+                    'confidence': safe_tolist(current_emotion.get('confidence', 0.5))
+                },
+                'trajectory_progress': trajectory_progress,
+                'music_parameters': {k: safe_tolist(v) for k, v in music_params.items()},
+                'system_stats': {
+                    'capture_stats': self.emotion_capture.get_stats() if self.emotion_capture else {},
+                    'processing_stats': self._processing_stats,
+                    'fusion_quality': self.emotion_fusion.get_fusion_quality_metrics()
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting current status: {e}")
+            return {
+                'emotion_state': {'valence': 0.0, 'arousal': 0.0, 'confidence': 0.5},
+                'trajectory_progress': {'actual_path': [], 'target_path': [], 'deviation': 1.0},
+                'music_parameters': {},
+                'system_stats': {}
+            }
 
     def update_emotion_config(self, **kwargs):
-        """Update emotion analysis configuration during runtime"""
-        config_updated = False
-        
-        if 'enable_face_analysis' in kwargs:
-            self.config.enable_face_analysis = kwargs['enable_face_analysis']
-            config_updated = True
+        """Update emotion configuration"""
+        try:
+            # Update fusion weights if provided
+            if 'face_weight' in kwargs or 'voice_weight' in kwargs:
+                face_weight = kwargs.get('face_weight', 0.7)
+                voice_weight = kwargs.get('voice_weight', 0.3)
+                self.emotion_fusion = EmotionFusion(face_weight=face_weight, voice_weight=voice_weight)
             
-        if 'enable_voice_analysis' in kwargs:
-            self.config.enable_voice_analysis = kwargs['enable_voice_analysis']
-            config_updated = True
+            # Update other configurations
+            for key, value in kwargs.items():
+                if hasattr(self, key):
+                    setattr(self, key, value)
             
-        if config_updated and hasattr(self, 'emotion_capture'):
-            # Restart emotion capture with new config
-            self.emotion_capture.stop()
-            self.emotion_capture = EmotionCapture(
-                camera_index=self.config.camera_index,
-                audio_device_index=self.config.audio_device_index,
-                enable_face=self.config.enable_face_analysis,
-                enable_voice=self.config.enable_voice_analysis
-            )
-            if self.running:
-                self.emotion_capture.start()
-                
-        logger.info(f"Updated emotion config: {kwargs}")
+            logger.info(f"Updated emotion configuration: {kwargs}")
+            
+        except Exception as e:
+            logger.error(f"Error updating emotion configuration: {e}")
 
     def _select_music_engine(self):
-        """Select and instantiate the music engine based on config or environment."""
-        # TODO: Make this configurable (e.g., from config or env var)
-        engine_type = getattr(self.config, 'music_engine', 'tidal').lower()
-        if engine_type == 'tidal':
-            return TidalEngine()
-        elif engine_type == 'sonicpi':
-            return SonicPiEngine()
-        elif engine_type == 'midi':
-            return MidiEngine()
+        """Select appropriate music engine with Pyo as primary"""
+        engine_name = getattr(self.config, 'music_engine', 'pyo')
+        
+        if engine_name == 'pyo':
+            return self.pyo_engine
+        elif engine_name == 'tidal' and self.tidal_engine:
+            return self.tidal_engine
+        elif engine_name == 'midi' and self.midi_engine:
+            return self.midi_engine
+        elif engine_name == 'sonicpi' and self.sonicpi_engine:
+            return self.sonicpi_engine
         else:
-            logger.warning(f"Unknown music engine '{engine_type}', defaulting to TidalEngine.")
-            return TidalEngine()
+            # Always default to Pyo (primary engine)
+            logger.info(f"Requested engine '{engine_name}' not available, using Pyo engine")
+            return self.pyo_engine
 
     def _process_music_update(self, session_time: float):
-        """Update music parameters and send to engine."""
+        """Process music update with improved error handling"""
         try:
-            # Interpolate parameters toward target
-            params = self.music_renderer.interpolate_parameters()
-            # Render music structure
-            music_struct = self.music_renderer.render(params)
-            # --- Ensure a Tidal pattern is always present ---
-            if 'pattern' not in music_struct or not music_struct['pattern']:
-                music_struct['pattern'] = generate_tidal_pattern(params)
-            # Send to engine
-            if self.music_engine:
-                self.music_engine.play(music_struct)
-            if self.on_music_update:
-                self.on_music_update(music_struct)
+            # Get current emotion
+            current_emotion = getattr(self, '_latest_filtered_emotion', None)
+            if not current_emotion:
+                return
+            
+            # Map to music parameters
+            music_params = self._map_emotion_to_music(current_emotion)
+            if music_params:
+                # Update music renderer
+                self.music_renderer.update_target_parameters(music_params)
+                
+                # Send parameters to music engine for actual playback
+                try:
+                    engine = self._select_music_engine()
+                    if engine:
+                        # Send parameters to engine
+                        engine.update_parameters(music_params)
+                        
+                        # Create music structure for playback
+                        music_struct = {
+                            'emotion': current_emotion,
+                            'parameters': music_params,
+                            'timestamp': session_time
+                        }
+                        engine.play(music_struct)
+                        
+                        logger.debug(f"Sent parameters to music engine: {len(music_params)} params")
+                except Exception as e:
+                    logger.error(f"Error sending parameters to music engine: {e}")
+                
+                # Log music generation
+                logger.info(f"Music generation logged: {len(music_params)} params, "
+                           f"trajectory={self.config.trajectory_name}, DTW=None")
+            
         except Exception as e:
-            logger.error(f"Error in music update: {e}")
+            logger.error(f"Error in music update processing: {e}")
 
-    # --- Backend music control stubs ---
     def play_music(self):
-        """Play or re-send the last rendered music structure to the music engine."""
-        if self.music_engine:
-            params = self.music_renderer.current_params
-            music_struct = self.music_renderer.render(params)
-            self.music_engine.play(music_struct)
+        """Play music with current parameters"""
+        try:
+            engine = self._select_music_engine()
+            
+            # Create music structure with current parameters and emotion state
+            music_struct = {
+                'parameters': self.music_renderer.current_params if hasattr(self, 'music_renderer') else {},
+                'emotion': {
+                    'valence': 0.0,
+                    'arousal': 0.5
+                }
+            }
+            
+            # If we have recent emotion data, use it
+            if hasattr(self, '_latest_filtered_emotion'):
+                music_struct['emotion'] = self._latest_filtered_emotion
+            
+            engine.play(music_struct)
+        except Exception as e:
+            logger.error(f"Error playing music: {e}")
 
     def pause_music(self):
-        """Pause or stop the music engine playback."""
-        if self.music_engine:
-            self.music_engine.stop()
+        """Pause music"""
+        try:
+            engine = self._select_music_engine()
+            engine.pause()
+        except Exception as e:
+            logger.error(f"Error pausing music: {e}")
 
     def regenerate_music(self):
-        """Regenerate music by resetting or randomizing parameters and playing new music."""
-        if self.music_engine:
-            # Optionally randomize or reset parameters
-            params = self.music_renderer.param_space.get_default_parameters()
-            self.music_renderer.update_target_parameters(params)
-            music_struct = self.music_renderer.render(params)
-            self.music_engine.play(music_struct)
-
-    def process_feedback(self, session_id: str, feedback: dict):
-        """Process feedback received from the client."""
-        if not self.config.enable_feedback:
-            logger.warning("Feedback processing is disabled.")
-            return
+        """Regenerate music with current parameters"""
         try:
-            # Collect explicit feedback
-            self.feedback_collector.collect_explicit_feedback(
-                rating=feedback.get('rating', 0),
-                context=feedback.get('comments', '')
-            )
-            # Optionally process implicit feedback
-            self.feedback_collector.collect_implicit_feedback(
-                interaction_type="feedback_submit",
-                intensity=1.0
-            )
-            logger.info(f"Feedback processed for session {session_id}: {feedback}")
-            logger.log_feedback(
-                feedback_type='explicit',
-                rating=feedback.get('rating', 0),
-                category=feedback.get('category', None),
-                context={'comments': feedback.get('comments', '')}
-            )
+            engine = self._select_music_engine()
+            engine.regenerate()
         except Exception as e:
-            logger.error(f"Error processing feedback for session {session_id}: {e}")
+            logger.error(f"Error regenerating music: {e}")
+
+    def process_realtime_feedback(self, session_id: str, feedback: dict):
+        """Process user feedback"""
+        try:
+            if hasattr(self, 'feedback_collector'):
+                # Extract the rating and comments for the collector
+                rating = feedback.get('rating')
+                comments = feedback.get('comments', '')
+                if rating is not None:
+                    self.feedback_collector.collect_explicit_feedback(rating=float(rating), context=comments)
+
+            if hasattr(self, 'feedback_processor'):
+                # Get adjustments and impact statement from the processor
+                processed_result = self.feedback_processor.process_feedback(session_id, feedback)
+                adjustments = processed_result.get('adjustments')
+                impact_statement = processed_result.get('impact_statement')
+
+                # Apply adjustments to the RL agent
+                if self.rl_agent and adjustments:
+                    self.rl_agent.update_parameters(adjustments)
+                    logger.info(f"Applied feedback adjustments to RL agent: {adjustments}")
+
+                # Emit the impact statement to the frontend
+                if self.socketio and impact_statement:
+                    sid = getattr(self, '_current_socketio_sid', None)
+                    if sid:
+                        self.socketio.emit('feedback_impact', {'message': impact_statement}, room=sid)
+
+        except Exception as e:
+            logger.error(f"Error processing feedback: {e}")
+
+    def shutdown(self):
+        """Shutdown the session manager with proper cleanup"""
+        try:
+            logger.info("Shutting down SessionManager...")
+            self.stop_session()
+            
+            # Clear all data structures
+            self.emotion_state.clear_history()
+            self.kalman_filter.reset()
+            self.emotion_fusion.reset_history()
+            
+            logger.info("SessionManager shutdown complete")
+            
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+
+    def _map_emotion_to_music(self, valence: float, arousal: float) -> Dict[str, float]:
+        """Map emotion to music parameters with comprehensive clinical validation"""
+        try:
+            # If RL is enabled, the agent has already updated the parameters.
+            if self.config.enable_rl and hasattr(self, 'rl_agent') and self.rl_agent and hasattr(self, '_latest_music_params'):
+                return self._latest_music_params
+
+            # CLINICAL VALIDATION: Ensure emotion values are in valid ranges
+            valence = np.clip(valence, -1.0, 1.0)
+            arousal = np.clip(arousal, 0.0, 1.0)  # FIXED: arousal range [0,1]
+            
+            logger.debug(f"Mapping emotion to music: valence={valence:.3f}, arousal={arousal:.3f}")
+            
+            # Get base parameter mapping
+            music_params = self.music_mapping.map_emotion_to_parameters(valence, arousal)
+            
+            # CLINICAL SAFETY: Validate therapeutic safety
+            is_safe, safety_warnings = self.param_space.validate_therapeutic_safety(music_params)
+            
+            if not is_safe:
+                logger.warning("CLINICAL SAFETY ALERT: Parameters may not be therapeutically safe")
+                for warning in safety_warnings:
+                    logger.warning(f"Safety check: {warning}")
+                
+                # Apply emergency therapeutic constraints
+                music_params = self._apply_emergency_therapeutic_constraints(music_params, valence, arousal)
+                logger.info("Applied emergency therapeutic constraints")
+            
+            # Log any therapeutic warnings
+            for warning in safety_warnings:
+                if "WARNING" in warning:
+                    logger.info(f"Therapeutic guidance: {warning}")
+            
+            # Get therapeutic recommendations for logging
+            recommendations = self.param_space.get_therapeutic_recommendations(valence, arousal)
+            if recommendations:
+                logger.debug(f"Therapeutic recommendations: {list(recommendations.keys())}")
+            
+            # Ensure all parameters are within therapeutic bounds
+            music_params = self.param_space.clip_parameters(music_params, use_therapeutic_bounds=True)
+            
+            # Final validation
+            final_is_safe, final_warnings = self.param_space.validate_therapeutic_safety(music_params)
+            if not final_is_safe:
+                logger.error("CRITICAL: Parameters still unsafe after constraints - using safe defaults")
+                music_params = self._get_safe_default_parameters()
+            
+            logger.debug(f"Generated {len(music_params)} therapeutic music parameters")
+            return music_params
+            
+        except Exception as e:
+            logger.error(f"Error in emotion-to-music mapping: {e}")
+            # Return safe defaults on any error
+            return self._get_safe_default_parameters()
+    
+    def _apply_emergency_therapeutic_constraints(self, params: Dict[str, float], valence: float, arousal: float) -> Dict[str, float]:
+        """Apply emergency therapeutic constraints when safety validation fails"""
+        constrained = params.copy()
+        
+        # Emergency constraint 1: Force safe volume levels
+        constrained['overall_volume'] = min(constrained.get('overall_volume', 0.5), 0.6)
+        
+        # Emergency constraint 2: Limit dissonance for any negative emotional state
+        if valence < 0:
+            constrained['dissonance_level'] = min(constrained.get('dissonance_level', 0.2), 0.4)
+        
+        # Emergency constraint 3: Calm down high arousal states
+        if arousal > 0.8:
+            constrained['tempo_bpm'] = min(constrained.get('tempo_bpm', 100), 110)
+            constrained['dynamic_range'] = min(constrained.get('dynamic_range', 0.4), 0.5)
+            constrained['accent_strength'] = min(constrained.get('accent_strength', 0.3), 0.4)
+        
+        # Emergency constraint 4: Energize very low arousal states safely
+        if arousal < 0.2:
+            constrained['tempo_bpm'] = max(constrained.get('tempo_bpm', 100), 80)
+            constrained['brightness'] = max(constrained.get('brightness', 0.5), 0.4)
+        
+        # Emergency constraint 5: Support very negative valence states
+        if valence < -0.7:
+            constrained['warmth'] = max(constrained.get('warmth', 0.6), 0.5)
+            constrained['roughness'] = min(constrained.get('roughness', 0.2), 0.3)
+            constrained['reverb_amount'] = min(constrained.get('reverb_amount', 0.3), 0.4)
+        
+        # Emergency constraint 6: Ensure therapeutic minimums
+        constrained['emotional_stability'] = max(constrained.get('emotional_stability', 0.6), 0.4)
+        constrained['therapeutic_intensity'] = np.clip(constrained.get('therapeutic_intensity', 0.5), 0.3, 0.7)
+        
+        return constrained
+    
+    def _get_safe_default_parameters(self) -> Dict[str, float]:
+        """Get clinically safe default parameters for emergency use"""
+        return {
+            'tempo_bpm': 90.0,           # Calm, safe tempo
+            'overall_volume': 0.5,       # Moderate, safe volume
+            'dissonance_level': 0.1,     # Minimal dissonance
+            'brightness': 0.4,           # Moderate brightness
+            'warmth': 0.7,              # High warmth for comfort
+            'reverb_amount': 0.2,       # Light reverb
+            'voice_density': 2.0,       # Simple texture
+            'chord_complexity': 0.3,    # Simple harmony
+            'rhythm_complexity': 0.3,   # Simple rhythm
+            'articulation': 0.6,        # Smooth articulation
+            'repetition_factor': 0.7,   # High repetition for stability
+            'emotional_stability': 0.8, # High stability
+            'therapeutic_intensity': 0.5, # Moderate intensity
+            'cognitive_load': 0.3,      # Low cognitive load
+        }

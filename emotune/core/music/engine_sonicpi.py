@@ -23,14 +23,21 @@ class SonicPiEngine(MusicEngineBase):
         
         try:
             server = ThreadingOSCUDPServer(('127.0.0.1', self.receive_port), dispatcher)
+            server.timeout = 2.0  # Add 2 second timeout
             self.client.send_message("/ping", [])
             
-            # Wait briefly for response
+            # Wait briefly for response with timeout
             server.handle_request()
             if not self.connected:
                 self.logger.warning("Sonic Pi connection verification failed - no response to ping")
         except Exception as e:
             self.logger.error(f"OSC connection error: {str(e)}")
+        finally:
+            # Ensure server is closed
+            try:
+                server.server_close()
+            except:
+                pass
 
     def _handle_ping_reply(self, *args):
         self.connected = True

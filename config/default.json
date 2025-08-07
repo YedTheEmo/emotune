@@ -1,7 +1,7 @@
 {
   "secret_key": "emo",
   "version": "0.2.0",
-  "enable_rl": false,
+  "enable_rl": true,
   "enable_feedback": true,
   "trajectory_name": "calm_down",
   "session_duration": 300,
@@ -14,8 +14,12 @@
   "kalman": {},
   "rl": {},
   "trajectory": {},
-  "music": {},
-  "music_engine": "sonicpi",
+  "music": {
+    "audio_backend": "portaudio",
+    "sample_rate": 44100,
+    "buffer_size": 256
+  },
+  "music_engine": "pyo",
   "session": {
       "device": "cpu",
       "camera_index": 0,
@@ -23,7 +27,7 @@
       "music_update_rate": 1.0,
       "trajectory_name": "calm_down",
       "session_duration": 300,
-      "enable_rl": false,
+      "enable_rl": true,
       "enable_feedback": true,
       "enable_face_analysis": true,
       "enable_voice_analysis": false,

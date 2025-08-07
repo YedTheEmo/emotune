@@ -3,84 +3,151 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EmoTune - Adaptive Musical Therapy</title>
+    <title>EmoTune - Adaptive Music Therapy</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Crimson+Text:wght@400;600;700&family=Playfair+Display:wght@400;700;900&display=swap" rel="stylesheet">
     <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
 </head>
 <body>
-    <div class="container">
-        <!-- Header -->
-        <header class="header">
-            <div class="logo">
-                <i class="fas fa-music"></i>
-                <h1>EmoTune</h1>
-                <span class="tagline">Adaptive Musical Therapy</span>
+    <div class="gothic-container">
+        <!-- Gothic Header -->
+        <header class="gothic-header">
+            <div class="gothic-logo">
+                <div class="logo-symbol">♠</div>
+                <div class="logo-text">
+                    <h1>EmoTune</h1>
+                    <span class="gothic-tagline">Adaptive Music Therapy</span>
+                </div>
             </div>
-            <div class="status-indicator">
-                <div class="status-dot" id="statusDot"></div>
-                <span id="statusText">Connecting...</span>
+            <div class="gothic-status">
+                <div class="status-orb" id="statusOrb"></div>
+                <span id="statusText">Initializing...</span>
             </div>
         </header>
 
-        <!-- Main Dashboard -->
-        <main class="dashboard">
-            <!-- Session Control Panel -->
-            <section class="control-panel">
-                <h2><i class="fas fa-play-circle"></i> Session Control</h2>
-                <div class="session-setup">
-                    <div class="form-group">
-                        <label for="trajectorySelect">Therapeutic Goal:</label>
-                        <select id="trajectorySelect" class="form-control">
-                            <option value="calm_down">Calm Down</option>
-                            <option value="energize">Energize</option>
-                            <option value="focus">Focus</option>
-                            <option value="uplift">Uplift</option>
-                            <option value="relax">Relax</option>
-                            <option value="stabilize">Stabilize</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label for="durationSlider">Duration: <span id="durationValue">5</span> minutes</label>
-                        <input type="range" id="durationSlider" min="2" max="30" value="5" class="slider">
-                    </div>
-                    <div class="session-buttons">
-                        <button id="startSessionBtn" class="btn btn-primary">
-                            <i class="fas fa-play"></i> Start Session
-                        </button>
-                        <button id="stopSessionBtn" class="btn btn-secondary" disabled>
-                            <i class="fas fa-stop"></i> Stop Session
-                        </button>
-                    </div>
+        <!-- Main Gothic Dashboard -->
+        <main class="gothic-dashboard">
+            <!-- Full-width Configuration Panel -->
+            <section class="gothic-panel configuration-panel full-width">
+                <div class="panel-header">
+                    <h2><i class="fas fa-sliders-h"></i> Configuration</h2>
                 </div>
-                <div class="session-info" id="sessionInfo" style="display: none;">
-                    <h3>Active Session</h3>
-                    <div class="info-grid">
-                        <div class="info-item">
-                            <span class="label">Goal:</span>
-                            <span id="currentGoal">-</span>
+                <div class="panel-content">
+                    <div class="gothic-form-horizontal">
+                        <div class="form-group">
+                            <label for="faceConfidenceSlider">Face Confidence: <span id="faceConfidenceValue">0.50</span></label>
+                            <input type="range" id="faceConfidenceSlider" min="0.1" max="0.9" value="0.5" step="0.05" class="gothic-slider">
                         </div>
-                        <div class="info-item">
-                            <span class="label">Duration:</span>
-                            <span id="currentDuration">-</span>
+                        <div class="form-group">
+                            <label for="voiceConfidenceSlider">Voice Confidence: <span id="voiceConfidenceValue">0.50</span></label>
+                            <input type="range" id="voiceConfidenceSlider" min="0.1" max="0.9" value="0.5" step="0.05" class="gothic-slider">
                         </div>
-                        <div class="info-item">
-                            <span class="label">Progress:</span>
-                            <div class="progress-bar">
-                                <div class="progress-fill" id="sessionProgress"></div>
+                        <div class="form-group">
+                            <label>Analysis Mode:</label>
+                            <div class="radio-group">
+                                <input type="radio" id="modeFusion" name="analysisMode" value="fusion" checked>
+                                <label for="modeFusion">Fusion</label>
+                                <input type="radio" id="modeFace" name="analysisMode" value="face">
+                                <label for="modeFace">Face Only</label>
+                                <input type="radio" id="modeVoice" name="analysisMode" value="voice">
+                                <label for="modeVoice">Voice Only</label>
                             </div>
-                            <span id="progressText">0%</span>
                         </div>
                     </div>
                 </div>
             </section>
 
-            <!-- Emotion Monitoring -->
-            <section class="emotion-display">
-                <h2><i class="fas fa-brain"></i> Emotion Monitoring</h2>
-                <div class="emotion-grid">
-                    <!-- Current Emotion State -->
-                    <div class="emotion-current">
-                        <h3>Current State</h3>
+            <!-- Session Control -->
+            <section class="gothic-panel session-control">
+                <div class="panel-header">
+                    <h2><i class="fas fa-skull"></i> Session Control</h2>
+                </div>
+                <div class="panel-content">
+                    <div class="gothic-form">
+                        <div class="form-group">
+                            <label for="trajectorySelect">Therapeutic Goal:</label>
+                            <select id="trajectorySelect" class="gothic-select">
+                                <option value="calm_down">Calm Down</option>
+                                <option value="energize">Energize</option>
+                                <option value="focus">Focus</option>
+                                <option value="uplift">Uplift</option>
+                                <option value="relax">Relax</option>
+                                <option value="stabilize">Stabilize</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="durationSlider">Duration: <span id="durationValue">5</span> minutes</label>
+                            <input type="range" id="durationSlider" min="2" max="30" value="5" class="gothic-slider">
+                        </div>
+                        <div class="gothic-buttons">
+                            <button id="startSessionBtn" class="gothic-btn gothic-btn-primary">
+                                <i class="fas fa-play"></i> Start Session
+                            </button>
+                            <button id="stopSessionBtn" class="gothic-btn gothic-btn-secondary" disabled>
+                                <i class="fas fa-stop"></i> Stop Session
+                            </button>
+                        </div>
+                    </div>
+                    <div class="session-info" id="sessionInfo" style="display: none;">
+                        <h3>Active Session</h3>
+                        <div class="info-grid">
+                            <div class="info-item">
+                                <span class="label">Goal:</span>
+                                <span id="currentGoal">-</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="label">Duration:</span>
+                                <span id="currentDuration">-</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="label">Progress:</span>
+                                <div class="gothic-progress">
+                                    <div class="progress-fill" id="sessionProgress"></div>
+                                </div>
+                                <span id="progressText">0%</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Emotion & Media Monitoring -->
+            <section class="gothic-panel emotion-media">
+                <div class="panel-header">
+                    <h2><i class="fas fa-eye"></i> Emotion & Media Monitoring</h2>
+                </div>
+                <div class="panel-content">
+                    <div class="media-grid">
+                        <!-- Camera Feed -->
+                        <div class="media-feed camera-feed">
+                            <h3><i class="fas fa-video"></i> Visual Capture</h3>
+                            <div class="feed-container">
+                                <video id="cameraFeed" autoplay muted class="gothic-video">
+                                    <div class="feed-placeholder">
+                                        <i class="fas fa-camera"></i>
+                                        <span>Camera Feed</span>
+                                    </div>
+                                </video>
+                                <div class="feed-overlay">
+                                    <div class="feed-status" id="cameraStatus">Initializing...</div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Microphone Waveform -->
+                        <div class="media-feed audio-feed">
+                            <h3><i class="fas fa-microphone"></i> Audio Capture</h3>
+                            <div class="feed-container">
+                                <canvas id="audioWaveform" class="gothic-waveform"></canvas>
+                                <div class="feed-overlay">
+                                    <div class="feed-status" id="audioStatus">Initializing...</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Emotion Display -->
+                    <div class="emotion-display">
                         <div class="emotion-circle" id="emotionCircle">
                             <div class="emotion-point" id="emotionPoint"></div>
                             <div class="emotion-labels">
@@ -105,129 +172,214 @@
                             </div>
                         </div>
                     </div>
-                    <!-- Trajectory Visualization -->
-                    <div class="trajectory-display">
-                        <h3>Therapeutic Trajectory</h3>
-                        <canvas id="trajectoryCanvas" width="300" height="200"></canvas>
-                        <div class="trajectory-info">
-                            <div class="info-item">
-                                <span class="label">Target:</span>
-                                <span id="targetEmotion">-</span>
-                            </div>
-                            <div class="info-item">
-                                <span class="label">Deviation:</span>
-                                <span id="trajectoryDeviation">-</span>
-                            </div>
+                </div>
+            </section>
+
+            <!-- Trajectory Visualization -->
+            <section class="gothic-panel trajectory-panel">
+                <div class="panel-header">
+                    <h2><i class="fas fa-route"></i> Therapeutic Trajectory</h2>
+                </div>
+                <div class="panel-content">
+                    <canvas id="trajectoryCanvas" class="gothic-canvas"></canvas>
+                    <div class="trajectory-info">
+                        <div class="info-item">
+                            <span class="label">Target:</span>
+                            <span id="targetEmotion">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">Deviation:</span>
+                            <span id="trajectoryDeviation">-</span>
                         </div>
                     </div>
                 </div>
             </section>
 
             <!-- Music Control -->
-            <section class="music-control">
-                <h2><i class="fas fa-music"></i> Music Parameters</h2>
-                <div class="music-grid">
-                    <div class="parameter-group">
-                        <h4>Tempo & Rhythm</h4>
-                        <div class="parameter-item">
-                            <span class="label">Tempo:</span>
-                            <span id="tempoValue">-</span> BPM
-                        </div>
-                        <div class="parameter-item">
-                            <span class="label">Rhythm Complexity:</span>
-                            <div class="parameter-bar">
-                                <div class="parameter-fill" id="rhythmComplexity"></div>
+            <section class="gothic-panel music-panel">
+                <div class="panel-header">
+                    <h2><i class="fas fa-music"></i> Music Parameters</h2>
+                </div>
+                <div class="panel-content">
+                    <div class="music-grid">
+                        <div class="parameter-group">
+                            <h4>Tempo & Rhythm</h4>
+                            <div class="parameter-item">
+                                <span class="label">Tempo:</span>
+                                <span id="tempoValue">-</span> BPM
+                            </div>
+                            <div class="parameter-item">
+                                <span class="label">Rhythm Complexity:</span>
+                                <div class="gothic-bar">
+                                    <div class="bar-fill" id="rhythmComplexity"></div>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                    <div class="parameter-group">
-                        <h4>Harmony & Melody</h4>
-                        <div class="parameter-item">
-                            <span class="label">Key:</span>
-                            <span id="keyValue">-</span>
-                        </div>
-                        <div class="parameter-item">
-                            <span class="label">Harmonic Complexity:</span>
-                            <div class="parameter-bar">
-                                <div class="parameter-fill" id="harmonicComplexity"></div>
+                        <div class="parameter-group">
+                            <h4>Harmony & Melody</h4>
+                            <div class="parameter-item">
+                                <span class="label">Key:</span>
+                                <span id="keyValue">-</span>
+                            </div>
+                            <div class="parameter-item">
+                                <span class="label">Harmonic Complexity:</span>
+                                <div class="gothic-bar">
+                                    <div class="bar-fill" id="harmonicComplexity"></div>
+                                </div>
                             </div>
                         </div>
-                    </div>
-                    <div class="parameter-group">
-                        <h4>Texture & Dynamics</h4>
-                        <div class="parameter-item">
-                            <span class="label">Density:</span>
-                            <div class="parameter-bar">
-                                <div class="parameter-fill" id="textureDensity"></div>
+                        <div class="parameter-group">
+                            <h4>Texture & Dynamics</h4>
+                            <div class="parameter-item">
+                                <span class="label">Density:</span>
+                                <div class="gothic-bar">
+                                    <div class="bar-fill" id="textureDensity"></div>
+                                </div>
                             </div>
-                        </div>
-                        <div class="parameter-item">
-                            <span class="label">Volume:</span>
-                            <div class="parameter-bar">
-                                <div class="parameter-fill" id="volumeLevel"></div>
+                            <div class="parameter-item">
+                                <span class="label">Volume:</span>
+                                <div class="gothic-bar">
+                                    <div class="bar-fill" id="volumeLevel"></div>
+                                </div>
                             </div>
                         </div>
                     </div>
                 </div>
-                <div class="music-controls">
-                    <button id="playMusicBtn" class="btn btn-success">
-                        <i class="fas fa-play"></i> Play Music
-                    </button>
-                    <button id="pauseMusicBtn" class="btn btn-warning">
-                        <i class="fas fa-pause"></i> Pause
-                    </button>
-                    <button id="generateMusicBtn" class="btn btn-info">
-                        <i class="fas fa-sync"></i> Regenerate
-                    </button>
-                </div>
-                <div id="musicParamDebug" style="margin-top:10px; font-size:12px; color:#444;"></div>
             </section>
 
-            <!-- Feedback Section -->
-            <section class="feedback-section">
-                <h2><i class="fas fa-comments"></i> Feedback</h2>
-                <div class="feedback-form">
-                    <div class="rating-group">
-                        <label for="overallMood">Overall Mood:</label>
-                        <div class="rating-buttons" id="overallMood">
-                            <button class="rating-btn" data-rating="1" aria-label="Very Sad">😢</button>
-                            <button class="rating-btn" data-rating="2" aria-label="Sad">😐</button>
-                            <button class="rating-btn" data-rating="3" aria-label="Neutral">🙂</button>
-                            <button class="rating-btn" data-rating="4" aria-label="Happy">😊</button>
-                            <button class="rating-btn" data-rating="5" aria-label="Very Happy">😁</button>
+            <!-- RL Feedback System -->
+            <section class="gothic-panel feedback-panel">
+                <div class="panel-header">
+                    <h2><i class="fas fa-brain"></i> Reinforcement Learning Feedback</h2>
+                </div>
+                <div class="panel-content">
+                    <div class="rl-feedback-grid">
+                        <!-- Explicit Feedback -->
+                        <div class="feedback-section explicit-feedback">
+                            <h3><i class="fas fa-star"></i> Explicit Feedback</h3>
+                            <div class="feedback-form">
+                                <div class="rating-group">
+                                    <label>Current Emotional State:</label>
+                                    <div class="gothic-rating">
+                                        <button class="rating-btn" data-rating="1">Very Negative</button>
+                                        <button class="rating-btn" data-rating="2">Negative</button>
+                                        <button class="rating-btn" data-rating="3">Neutral</button>
+                                        <button class="rating-btn" data-rating="4">Positive</button>
+                                        <button class="rating-btn" data-rating="5">Very Positive</button>
+                                    </div>
+                                </div>
+                                <div class="feedback-sliders">
+                                    <div class="slider-group">
+                                        <label>Session Comfort: <span id="comfortValue">5</span></label>
+                                        <input type="range" id="comfortSlider" min="1" max="10" value="5" class="gothic-slider">
+                                    </div>
+                                    <div class="slider-group">
+                                        <label>Music Effectiveness: <span id="effectivenessValue">5</span></label>
+                                        <input type="range" id="effectivenessSlider" min="1" max="10" value="5" class="gothic-slider">
+                                    </div>
+                                </div>
+                                <button id="submitFeedbackBtn" class="gothic-btn">
+                                    <i class="fas fa-paper-plane"></i>
+                                    <span>Submit Feedback</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Implicit Feedback -->
+                        <div class="feedback-section implicit-feedback">
+                            <h3><i class="fas fa-eye"></i> Implicit Feedback</h3>
+                            <div class="implicit-metrics">
+                                <div class="metric-item" data-tooltip="How frequently the user interacts with the UI.">
+                                    <span class="label">Interaction Rate:</span>
+                                    <span id="interactionRate">-</span>
+                                </div>
+                                <div class="metric-item" data-tooltip="The total duration of the current therapy session.">
+                                    <span class="label">Session Duration:</span>
+                                    <span id="sessionDuration">-</span>
+                                </div>
+                                <div class="metric-item" data-tooltip="A measure of how much the user's emotion is fluctuating. Lower is more stable.">
+                                    <span class="label">Emotion Stability:</span>
+                                    <span id="emotionStability">-</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- RL Status -->
+                        <div class="feedback-section rl-status-section">
+                            <h3><i class="fas fa-cogs"></i> RL Agent Status</h3>
+                            <div class="rl-metrics">
+                                <div class="metric-item" data-tooltip="The number of experiences the agent has stored for learning.">
+                                    <span class="label">Buffer Size:</span>
+                                    <span id="rlBufferSize">0</span>
+                                </div>
+                                <div class="metric-item" data-tooltip="How quickly the agent learns from new experiences.">
+                                    <span class="label">Learning Rate:</span>
+                                    <span id="rlLearningRate">0.000</span>
+                                </div>
+                                <div class="metric-item" data-tooltip="The feedback signal (positive or negative) the agent received for its last action.">
+                                    <span class="label">Reward Signal:</span>
+                                    <span id="rlRewardSignal">0.000</span>
+                                </div>
+                                <div class="metric-item" data-tooltip="The agent's confidence in its current strategy (Alpha in SAC). Higher means more exploration.">
+                                    <span class="label">Policy Confidence:</span>
+                                    <span id="rlPolicyConfidence">0.000</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Feedback Impact -->
+                        <div class="feedback-section feedback-impact-section">
+                            <h3><i class="fas fa-magic"></i> Feedback Impact</h3>
+                            <div class="impact-content">
+                                <p id="feedbackImpactText">Submit feedback to see how it influences the music generation.</p>
+                            </div>
                         </div>
                     </div>
-                    <div class="feedback-sliders">
-                        <div class="slider-group">
-                            <label>Comfort during session: <span id="comfortValue">5</span></label>
-                            <input type="range" id="comfortSlider" min="1" max="10" value="5" class="slider">
-                        </div>
-                        <div class="slider-group">
-                            <label>Music effectiveness: <span id="effectivenessValue">5</span></label>
-                            <input type="range" id="effectivenessSlider" min="1" max="10" value="5" class="slider">
-                        </div>
-                        <!-- Optional: Trajectory helpfulness -->
-                        <!--
-                        <div class="slider-group">
-                            <label>Trajectory helpfulness: <span id="trajectoryHelpfulnessValue">3</span></label>
-                            <input type="range" id="trajectoryHelpfulnessSlider" min="1" max="5" value="3" class="slider">
-                        </div>
-                        -->
-                    </div>
-                    <div class="comments-section">
-                        <label for="feedbackComments">Additional Comments:</label>
-                        <textarea id="feedbackComments" rows="3" placeholder="How are you feeling? Any specific feedback about the music or session?"></textarea>
-                    </div>
-                    <div id="rlStatus" class="rl-status" style="margin-top: 1em; font-size: 0.95em; background: #f8f9fa; border-radius: 6px; padding: 0.5em 1em; border: 1px solid #e0e0e0;"></div>
-                    <button id="submitFeedbackBtn" class="btn btn-primary">
-                        <i class="fas fa-paper-plane"></i> Submit Feedback
-                    </button>
+                    
+                    <div class="feedback-status" id="feedbackStatus"></div>
                 </div>
             </section>
+            
+            <!-- System Logs Panel -->
+            <div class="gothic-panel">
+                <div class="panel-header">
+                    <h3><i class="fas fa-terminal"></i> System Logs</h3>
+                </div>
+                <div class="panel-content">
+                    <div class="log-container">
+                        <div class="log-section">
+                            <h4>Face Analysis</h4>
+                            <div id="faceLogs" class="log-content">Waiting for face data...</div>
+                        </div>
+                        <div class="log-section">
+                            <h4>Voice Analysis</h4>
+                            <div id="voiceLogs" class="log-content">Waiting for voice data...</div>
+                        </div>
+                        <div class="log-section">
+                            <h4>Fusion</h4>
+                            <div id="fusionLogs" class="log-content">Waiting for fusion data...</div>
+                        </div>
+                        <div class="log-section">
+                            <h4>Music Engine</h4>
+                            <div id="musicLogs" class="log-content">Waiting for music updates...</div>
+                        </div>
+                        <div class="log-section">
+                            <h4>Feedback</h4>
+                            <div id="feedbackLogs" class="log-content">Waiting for feedback...</div>
+                        </div>
+                        <div class="log-section">
+                            <h4>RL Agent</h4>
+                            <div id="rlLogs" class="log-content">Waiting for RL activity...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </main>
     </div>
-    <!-- WebRTC Video for emotion capture -->
+
+    <!-- Hidden video element for WebRTC -->
     <video id="videoElement" autoplay muted style="display: none;"></video>
+    
     <!-- Scripts -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script src="{{ url_for('static', filename='js/emotune.js') }}"></script>

@@ -1,8 +1,8 @@
 /**
- * EmoTune Main JavaScript - Client-side logic for real-time emotion monitoring and music control
+ * EmoTune Gothic JavaScript - Client-side logic for real-time emotion monitoring and music control
  */
 
-class EmoTuneClient {
+class EmoTuneGothicClient {
     constructor() {
         this.socket = null;
         this.isConnected = false;
@@ -11,6 +11,13 @@ class EmoTuneClient {
         this.audioContext = null;
         this.trajectoryCanvas = null;
         this.trajectoryCtx = null;
+        this.cameraStream = null;
+        this.audioStream = null;
+        this.audioAnalyser = null;
+        this.audioDataArray = null;
+        this.waveformCanvas = null;
+        this.waveformCtx = null;
+        this.animationFrame = null;
         
         this.init();
     }
@@ -20,6 +27,7 @@ class EmoTuneClient {
         this.setupEventListeners();
         this.setupCanvas();
         this.setupMediaCapture();
+        this.setupRLFeedback();
         this.updateUI();
     }
     
@@ -27,13 +35,13 @@ class EmoTuneClient {
         this.socket = io();
         
         this.socket.on('connect', () => {
-            console.log('Connected to EmoTune server');
+            console.log('Connected to EmoTune Gothic server');
             this.isConnected = true;
             this.updateConnectionStatus(true);
         });
         
         this.socket.on('disconnect', () => {
-            console.log('Disconnected from EmoTune server');
+            console.log('Disconnected from EmoTune Gothic server');
             this.isConnected = false;
             this.updateConnectionStatus(false);
         });
@@ -42,20 +50,26 @@ class EmoTuneClient {
             this.handleEmotionUpdate(data);
         });
         
-        this.socket.on('monitoring_started', () => {
-            console.log('Emotion monitoring started');
-            this.emotionMonitoring = true;
+        this.socket.on('monitoring_started', (data) => {
+            if (data && data.status === 'active') {
+                this.emotionMonitoring = true;
+                this.updateMediaStatus('active');
+                this.showGothicNotification('Media monitoring is active.', 'success');
+            }
         });
         
         this.socket.on('music_status', (data) => {
-            this.showNotification(`Music status: ${data.status}`, 'info');
+            this.showGothicNotification(`Music status: ${data.status}`, 'info');
         });
+        
         this.socket.on('music_parameters', (params) => {
             this.updateMusicParameters(params);
         });
+        
         this.socket.on('trajectory_info', (info) => {
-            // Optionally update trajectory visualization or info panel
+            this.updateTrajectoryInfo(info);
         });
+        
         this.socket.on('session_status', (data) => {
             if (data.active) {
                 this.currentSession = {
@@ -70,8 +84,15 @@ class EmoTuneClient {
                 this.updateSessionUI(false);
             }
         });
+
+        this.socket.on('feedback_impact', (data) => {
+            if (data && data.message) {
+                document.getElementById('feedbackImpactText').textContent = data.message;
+                this.showGothicNotification('Feedback processed and applied!', 'success');
+            }
+        });
+        
         this.socket.on('trajectory_progress', (progress) => {
-            // Update trajectory visualization and info fields
             this.updateTrajectoryVisualization(progress);
             if (progress.info && progress.info.target) {
                 document.getElementById('targetEmotion').textContent =
@@ -82,380 +103,582 @@ class EmoTuneClient {
                     progress.deviation.toFixed(3);
             }
         });
+        
+        this.socket.on('rl_status', (data) => {
+            this.updateRLStatus(data);
+        });
+        
         this.socket.on('error', (data) => {
-            this.showNotification(data.message, 'error');
-            // Optionally, log to console for debugging
-            console.error('EmoTune error:', data.message);
+            this.showGothicNotification(data.message, 'error');
+            console.error('EmoTune Gothic error:', data.message);
+        });
+        
+        this.socket.on('connect_error', (error) => {
+            console.error('Connection error:', error);
+            this.showGothicNotification('Connection failed. Retrying...', 'error');
+        });
+        
+        this.socket.on('reconnect', (attemptNumber) => {
+            console.log('Reconnected after', attemptNumber, 'attempts');
+            this.showGothicNotification('Reconnected to server', 'success');
         });
     }
     
     setupEventListeners() {
-        // Session controls
-        document.getElementById('startSessionBtn').addEventListener('click', () => this.startSession());
-        document.getElementById('stopSessionBtn').addEventListener('click', () => this.stopSession());
+        // Session control
+        document.getElementById('startSessionBtn').addEventListener('click', () => {
+            this.startSession();
+        });
+        
+        document.getElementById('stopSessionBtn').addEventListener('click', () => {
+            this.stopSession();
+        });
         
         // Duration slider
         const durationSlider = document.getElementById('durationSlider');
+        const durationValue = document.getElementById('durationValue');
         durationSlider.addEventListener('input', (e) => {
-            document.getElementById('durationValue').textContent = e.target.value;
+            durationValue.textContent = `${e.target.value} min`;
         });
         
-        // Music controls
-        document.getElementById('playMusicBtn').addEventListener('click', () => this.playMusic());
-        document.getElementById('pauseMusicBtn').addEventListener('click', () => this.pauseMusic());
-        document.getElementById('generateMusicBtn').addEventListener('click', () => this.generateMusic());
+        document.getElementById('submitFeedbackBtn').addEventListener('click', () => {
+            this.submitFeedback();
+        });
         
-        // Feedback controls
+        // Rating buttons
         document.querySelectorAll('.rating-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => this.selectRating(e.target));
+            btn.addEventListener('click', (e) => {
+                this.selectRating(e.target);
+            });
         });
         
+        // Feedback sliders
         const comfortSlider = document.getElementById('comfortSlider');
-        comfortSlider.addEventListener('input', (e) => {
-            document.getElementById('comfortValue').textContent = e.target.value;
-        });
-        
         const effectivenessSlider = document.getElementById('effectivenessSlider');
-        effectivenessSlider.addEventListener('input', (e) => {
-            document.getElementById('effectivenessValue').textContent = e.target.value;
+        const comfortValue = document.getElementById('comfortValue');
+        const effectivenessValue = document.getElementById('effectivenessValue');
+        
+        comfortSlider.addEventListener('input', (e) => {
+            comfortValue.textContent = e.target.value;
         });
         
-        document.getElementById('submitFeedbackBtn').addEventListener('click', () => this.submitFeedback());
+        effectivenessSlider.addEventListener('input', (e) => {
+            effectivenessValue.textContent = e.target.value;
+        });
+
+        // Confidence threshold sliders
+        const faceConfidenceSlider = document.getElementById('faceConfidenceSlider');
+        const voiceConfidenceSlider = document.getElementById('voiceConfidenceSlider');
+        const faceConfidenceValue = document.getElementById('faceConfidenceValue');
+        const voiceConfidenceValue = document.getElementById('voiceConfidenceValue');
+
+        faceConfidenceSlider.addEventListener('input', (e) => {
+            faceConfidenceValue.textContent = parseFloat(e.target.value).toFixed(2);
+            this.updateConfidenceThresholds();
+        });
+
+        voiceConfidenceSlider.addEventListener('input', (e) => {
+            voiceConfidenceValue.textContent = parseFloat(e.target.value).toFixed(2);
+            this.updateConfidenceThresholds();
+        });
+
+        // Analysis mode radio buttons
+        const analysisModeRadios = document.querySelectorAll('input[name="analysisMode"]');
+        analysisModeRadios.forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                this.updateAnalysisMode(e.target.value);
+            });
+        });
+    }
+
+    updateConfidenceThresholds() {
+        if (!this.isConnected) return;
+
+        const faceThreshold = parseFloat(document.getElementById('faceConfidenceSlider').value);
+        const voiceThreshold = parseFloat(document.getElementById('voiceConfidenceSlider').value);
+
+        this.socket.emit('update_confidence_thresholds', {
+            face: faceThreshold,
+            voice: voiceThreshold
+        });
+        this.showGothicNotification(`Confidence thresholds updated: Face=${faceThreshold.toFixed(2)}, Voice=${voiceThreshold.toFixed(2)}`, 'info');
+    }
+
+    updateAnalysisMode(mode) {
+        this.socket.emit('update_analysis_mode', { mode: mode }, (response) => {
+            if (response.success) {
+                console.log('Analysis mode updated successfully');
+            } else {
+                console.error('Failed to update analysis mode');
+            }
+        });
+        console.log('Emitting analysis mode:', mode);
     }
     
     setupCanvas() {
         this.trajectoryCanvas = document.getElementById('trajectoryCanvas');
         this.trajectoryCtx = this.trajectoryCanvas.getContext('2d');
+        
+        // Set canvas size
+        this.trajectoryCanvas.width = this.trajectoryCanvas.offsetWidth;
+        this.trajectoryCanvas.height = this.trajectoryCanvas.offsetHeight;
+        
         this.drawTrajectoryGrid();
     }
     
     async setupMediaCapture() {
-        // DO NOT open the camera or microphone in the browser!
-        // All camera/audio capture is handled by the backend (Python) only.
-        // This prevents resource conflicts and ensures only one process controls the webcam.
-        // If you want a preview, implement a backend-to-frontend streaming solution instead.
-        // This function is now a no-op for safety.
-        console.log('[EmoTune] setupMediaCapture: Camera/mic access is disabled in frontend to avoid resource conflicts.');
+        try {
+            // Setup camera feed
+            const cameraFeed = document.getElementById('cameraFeed');
+            const cameraStatus = document.getElementById('cameraStatus');
+            
+            // Setup audio waveform
+            this.waveformCanvas = document.getElementById('audioWaveform');
+            this.waveformCtx = this.waveformCanvas.getContext('2d');
+            this.waveformCanvas.width = this.waveformCanvas.offsetWidth;
+            this.waveformCanvas.height = this.waveformCanvas.offsetHeight;
+            
+            const audioStatus = document.getElementById('audioStatus');
+            
+            // Request media permissions
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { width: 640, height: 480 },
+                audio: true
+            });
+            
+            // Setup camera
+            this.cameraStream = stream.getVideoTracks()[0];
+            cameraFeed.srcObject = stream;
+            cameraStatus.textContent = 'Active';
+            cameraStatus.style.color = '#d4af37';
+            
+            // Setup audio
+            this.audioStream = stream.getAudioTracks()[0];
+            this.setupAudioAnalysis(stream);
+            audioStatus.textContent = 'Active';
+            audioStatus.style.color = '#d4af37';
+            
+        } catch (error) {
+            console.error('Media capture error:', error);
+            this.updateMediaStatus('error');
+        }
+    }
+    
+    setupAudioAnalysis(stream) {
+        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = this.audioContext.createMediaStreamSource(stream);
+        this.audioAnalyser = this.audioContext.createAnalyser();
+        this.audioAnalyser.fftSize = 256;
+        
+        source.connect(this.audioAnalyser);
+        this.audioDataArray = new Uint8Array(this.audioAnalyser.frequencyBinCount);
+        
+        this.drawAudioWaveform();
+    }
+    
+    drawAudioWaveform() {
+        if (!this.audioAnalyser || !this.waveformCtx) return;
+        
+        this.audioAnalyser.getByteFrequencyData(this.audioDataArray);
+        
+        const canvas = this.waveformCanvas;
+        const ctx = this.waveformCtx;
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        // Clear canvas
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(0, 0, width, height);
+        
+        // Draw waveform
+        const barWidth = width / this.audioDataArray.length;
+        ctx.fillStyle = '#d4af37';
+        
+        for (let i = 0; i < this.audioDataArray.length; i++) {
+            const barHeight = (this.audioDataArray[i] / 255) * height;
+            const x = i * barWidth;
+            const y = height - barHeight;
+            
+            ctx.fillRect(x, y, barWidth - 1, barHeight);
+        }
+        
+        this.animationFrame = requestAnimationFrame(() => this.drawAudioWaveform());
+    }
+    
+    setupRLFeedback() {
+        // Initialize RL feedback tracking
+        this.selectedRating = 0;
+        this.rlFeedback = {
+            explicit: { comfort: 5, effectiveness: 5 },
+            implicit: { interactionRate: 0, sessionDuration: 0, emotionStability: 0 },
+            rl: { bufferSize: 0, learningRate: 0, rewardSignal: 0, policyConfidence: 0 }
+        };
+        
+        // Update RL metrics periodically
+        setInterval(() => {
+            this.updateRLMetrics();
+        }, 1000);
+    }
+    
+    updateRLMetrics() {
+        // This method is no longer needed as data comes from the server.
+    }
+    
+    updateRLDisplay(feedback, rlAgent) {
+        // Update RL metrics display
+        if (feedback) {
+            document.getElementById('interactionRate').textContent = (feedback.total_feedback || 0).toFixed(2);
+            document.getElementById('sessionDuration').textContent = (feedback.session_duration || 0).toFixed(1) + 's';
+            document.getElementById('emotionStability').textContent = (feedback.average_score || 0).toFixed(3);
+        }
+
+        if (rlAgent) {
+            document.getElementById('rlBufferSize').textContent = rlAgent.buffer_size || 0;
+            document.getElementById('rlLearningRate').textContent = (rlAgent.learning_rate || 0).toFixed(3);
+            document.getElementById('rlRewardSignal').textContent = (rlAgent.reward_signal || 0).toFixed(3);
+            document.getElementById('rlPolicyConfidence').textContent = (rlAgent.policy_confidence || 0).toFixed(3);
+        }
+    }
+    
+    updateSystemLogs(data) {
+        // Update face analysis logs
+        if (data.face_data) {
+            const faceLog = document.getElementById('faceLogs');
+            faceLog.textContent = `Face Data: V=${data.face_data.valence?.toFixed(3) || 'N/A'}, A=${data.face_data.arousal?.toFixed(3) || 'N/A'}`;
+        }
+        
+        // Update voice analysis logs
+        if (data.voice_data) {
+            const voiceLog = document.getElementById('voiceLogs');
+            voiceLog.textContent = `Voice Data: V=${data.voice_data.valence?.toFixed(3) || 'N/A'}, A=${data.voice_data.arousal?.toFixed(3) || 'N/A'}`;
+        }
+        
+        // Update fusion logs
+        if (data.fusion) {
+            const fusionLog = document.getElementById('fusionLogs');
+            fusionLog.textContent = `Fusion: V=${data.fusion.valence?.toFixed(3) || 'N/A'}, A=${data.fusion.arousal?.toFixed(3) || 'N/A'}, C=${data.fusion.confidence?.toFixed(3) || 'N/A'}`;
+        }
+        
+        // Update music engine logs
+        if (data.music_engine) {
+            const musicLog = document.getElementById('musicLogs');
+            musicLog.textContent = `Music Engine: ${data.music_engine.status || 'Unknown'}\nTempo: ${data.music_engine.tempo || 'N/A'} BPM\nVolume: ${data.music_engine.volume || 'N/A'}`;
+        }
+        
+        // Update feedback logs
+        if (data.feedback) {
+            const feedbackLog = document.getElementById('feedbackLogs');
+            feedbackLog.textContent = `Feedback: ${data.feedback.type || 'None'}\nRating: ${data.feedback.rating || 'N/A'}\nTime: ${new Date().toLocaleTimeString()}`;
+        }
+        
+        // Update RL logs
+        if (data.rl_agent) {
+            const rlLog = document.getElementById('rlLogs');
+            rlLog.textContent = `RL Agent: ${data.rl_agent.status || 'Unknown'}\nReward: ${data.rl_agent.reward_signal?.toFixed(3) || 'N/A'}\nAction: ${data.rl_agent.action || 'N/A'}`;
+            this.updateRLDisplay(data.feedback, data.rl_agent);
+        }
     }
     
     updateConnectionStatus(connected) {
-        const statusDot = document.getElementById('statusDot');
+        const statusOrb = document.getElementById('statusOrb');
         const statusText = document.getElementById('statusText');
         
         if (connected) {
-            statusDot.classList.add('connected');
+            statusOrb.classList.add('connected');
             statusText.textContent = 'Connected';
+            statusText.style.color = '#d4af37';
         } else {
-            statusDot.classList.remove('connected');
+            statusOrb.classList.remove('connected');
             statusText.textContent = 'Disconnected';
+            statusText.style.color = '#8b0000';
+        }
+    }
+    
+    updateMediaStatus(status) {
+        const cameraStatus = document.getElementById('cameraStatus');
+        const audioStatus = document.getElementById('audioStatus');
+        
+        switch (status) {
+            case 'active':
+                cameraStatus.textContent = 'Active';
+                audioStatus.textContent = 'Active';
+                cameraStatus.style.color = '#d4af37'; // Gold for active
+                audioStatus.style.color = '#d4af37';
+                break;
+            case 'error':
+                cameraStatus.textContent = 'Error';
+                audioStatus.textContent = 'Error';
+                cameraStatus.style.color = '#8b0000'; // Dark red for error
+                audioStatus.style.color = '#8b0000';
+                break;
+            default:
+                cameraStatus.textContent = 'Initializing...';
+                audioStatus.textContent = 'Initializing...';
+                cameraStatus.style.color = '#a0a0a0'; // Grey for initializing
+                audioStatus.style.color = '#a0a0a0';
         }
     }
     
     async startSession() {
         if (!this.isConnected) {
-            this.showNotification('Not connected to server', 'error');
+            this.showGothicNotification('Not connected to server', 'error');
             return;
         }
         
         const trajectoryType = document.getElementById('trajectorySelect').value;
-        const duration = parseInt(document.getElementById('durationSlider').value) * 60; // Convert to seconds
+        const duration = parseInt(document.getElementById('durationSlider').value);
         
         try {
             const response = await fetch('/session/start', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ trajectory_type: trajectoryType, duration: duration })
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    trajectory_type: trajectoryType,
+                    duration: duration
+                })
             });
             
-            const data = await response.json();
+            const result = await response.json();
             
-            if (data.success) {
-                this.currentSession = {
-                    id: data.session_id,
-                    trajectory_type: trajectoryType,
-                    duration: duration,
-                    startTime: Date.now()
-                };
-                
-                this.updateSessionUI(true);
-                this.startEmotionMonitoring();
-                this.showNotification('Session started successfully', 'success');
+            if (result.success) {
+                this.showGothicNotification('Session started successfully', 'success');
+                document.getElementById('startSessionBtn').disabled = true;
+                document.getElementById('stopSessionBtn').disabled = false;
             } else {
-                this.showNotification(data.error || 'Failed to start session', 'error');
+                this.showGothicNotification(`Failed to start session: ${result.error}`, 'error');
             }
         } catch (error) {
-            console.error('Error starting session:', error);
-            this.showNotification('Failed to start session', 'error');
+            console.error('Start session error:', error);
+            this.showGothicNotification('Failed to start session', 'error');
         }
     }
     
     async stopSession() {
-        if (!this.currentSession) return;
+        if (!this.isConnected) {
+            this.showGothicNotification('Not connected to server', 'error');
+            return;
+        }
         
         try {
             const response = await fetch('/session/stop', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' }
+                headers: {
+                    'Content-Type': 'application/json',
+                }
             });
             
-            const data = await response.json();
+            const result = await response.json();
             
-            if (data.success) {
-                this.currentSession = null;
-                this.emotionMonitoring = false;
-                this.updateSessionUI(false);
-                this.showNotification('Session stopped successfully', 'success');
+            if (result.success) {
+                this.showGothicNotification('Session ended', 'info');
+                document.getElementById('startSessionBtn').disabled = false;
+                document.getElementById('stopSessionBtn').disabled = true;
             } else {
-                this.showNotification(data.error || 'Failed to stop session', 'error');
+                this.showGothicNotification(`Failed to stop session: ${result.error}`, 'error');
             }
         } catch (error) {
-            console.error('Error stopping session:', error);
-            this.showNotification('Failed to stop session', 'error');
+            console.error('Stop session error:', error);
+            this.showGothicNotification('Failed to stop session', 'error');
         }
     }
     
-    startEmotionMonitoring() {
-        if (!this.currentSession) return;
-        this.socket.emit('start_emotion_monitoring');
-        // Emit emotion_data every second to trigger backend mapping pipeline
-        if (this.emotionDataInterval) clearInterval(this.emotionDataInterval);
-        this.emotionDataInterval = setInterval(() => {
-            // --- PATCH: include session UUID in payload ---
-            const payload = { session_uuid: this.currentSession.id };
-            this.socket.emit('emotion_data', payload);
-        }, 1000);
-        // Only update session progress bar locally.
-        this.progressInterval = setInterval(() => {
-            this.updateSessionProgress();
-        }, 1000);
-    }
-
     handleEmotionUpdate(data) {
-        console.log('[EmoTune] handleEmotionUpdate called:', data);
-        // --- Show backend warning if present ---
-        if (data && data.warning) {
-            this.showNotification(data.warning, 'warning');
-        }
-        // --- ADDED: Confirm receipt of emotion_update from backend ---
-        if (data && data.emotion_state) {
-            console.info('[EmoTune] Received emotion_update from backend:', data.emotion_state);
-        }
-        // Update emotion display
+        console.log('Received emotion update:', data);
+        
         if (data.emotion_state) {
-            console.log('[EmoTune] Updating emotion display:', data.emotion_state);
             this.updateEmotionDisplay(data.emotion_state);
         }
-        // Update trajectory visualization and info
-        if (data.trajectory_progress) {
-            console.log('[EmoTune] Updating trajectory visualization:', data.trajectory_progress);
-            this.updateTrajectoryVisualization(data.trajectory_progress);
-            // Robustly update target and deviation fields
-            let info = data.trajectory_progress.info || {};
-            if (info.target && typeof info.target.valence === 'number' && typeof info.target.arousal === 'number') {
-                document.getElementById('targetEmotion').textContent =
-                    `(${info.target.valence.toFixed(2)}, ${info.target.arousal.toFixed(2)})`;
-            } else {
-                document.getElementById('targetEmotion').textContent = '-';
-            }
-            if (typeof data.trajectory_progress.deviation === 'number') {
-                document.getElementById('trajectoryDeviation').textContent =
-                    data.trajectory_progress.deviation.toFixed(3);
-            } else {
-                document.getElementById('trajectoryDeviation').textContent = '-';
-            }
-        }
-        // Update music parameters display
+        
         if (data.music_parameters) {
-            console.log('[EmoTune] Updating music parameters:', data.music_parameters);
             this.updateMusicParameters(data.music_parameters);
         }
-        // RL/adaptation/feedback status display
-        if (data.rl_status) {
-            console.log('[EmoTune] RL status:', data.rl_status);
-            const rlDiv = document.getElementById('rlStatus');
-            if (rlDiv) {
-                let html = '';
-                if (data.rl_status.training_summary) {
-                    html += `<b>RL Buffer:</b> ${data.rl_status.training_summary.buffer_size} <br/>`;
-                    html += `<b>Current Params:</b> ${JSON.stringify(data.rl_status.training_summary.current_params)} <br/>`;
-                }
-                if (data.rl_status.feedback) {
-                    html += `<b>Feedback Reward:</b> ${data.rl_status.feedback.reward?.toFixed(3)} <br/>`;
-                    html += `<b>Feedback Confidence:</b> ${data.rl_status.feedback.confidence?.toFixed(2)} <br/>`;
-                    html += `<b>Feedback Trend:</b> ${data.rl_status.feedback.trend?.toFixed(3)} <br/>`;
-                }
-                if (data.rl_status.adaptation) {
-                    html += `<b>Adaptations:</b> ${data.rl_status.adaptation.total_adaptations} <br/>`;
-                    html += `<b>Recent Adaptations:</b> ${data.rl_status.adaptation.recent_adaptations} <br/>`;
-                    html += `<b>Adaptation Rate:</b> ${data.rl_status.adaptation.adaptation_rate?.toFixed(3)} /min <br/>`;
-                }
-                rlDiv.innerHTML = html;
-            }
+        
+        if (data.trajectory_progress) {
+            this.updateTrajectoryVisualization(data.trajectory_progress);
+        }
+        
+        // Update system logs with the received data
+        if (data.system_logs) {
+            this.updateSystemLogs(data.system_logs);
         }
     }
-
+    
     updateEmotionDisplay(emotionState) {
         const valence = emotionState.valence || 0;
         const arousal = emotionState.arousal || 0;
         const confidence = emotionState.confidence || 0;
         
-        // Update emotion circle position
+        // Update emotion circle
         const emotionPoint = document.getElementById('emotionPoint');
-        const circleRadius = 90; // Half of circle width minus point radius
+        const circle = document.getElementById('emotionCircle');
+        const circleRect = circle.getBoundingClientRect();
+        const centerX = circleRect.width / 2;
+        const centerY = circleRect.height / 2;
         
-        const x = (valence * circleRadius) + circleRadius;
-        const y = (-arousal * circleRadius) + circleRadius;
+        // Convert valence/arousal to canvas coordinates
+        const x = centerX + (valence * centerX * 0.8);
+        const y = centerY - (arousal * centerY * 0.8);
         
         emotionPoint.style.left = `${x}px`;
         emotionPoint.style.top = `${y}px`;
         
-        // Update values display
-        document.getElementById('valenceValue').textContent = valence.toFixed(2);
-        document.getElementById('arousalValue').textContent = arousal.toFixed(2);
-        document.getElementById('confidenceValue').textContent = `${(confidence * 100).toFixed(0)}%`;
+        // Update values
+        document.getElementById('valenceValue').textContent = valence.toFixed(3);
+        document.getElementById('arousalValue').textContent = arousal.toFixed(3);
+        document.getElementById('confidenceValue').textContent = confidence.toFixed(3);
     }
     
     updateTrajectoryVisualization(trajectoryProgress) {
-        if (!this.trajectoryCtx || !trajectoryProgress) return;
-        const ctx = this.trajectoryCtx;
+        if (!this.trajectoryCtx) return;
+        
         const canvas = this.trajectoryCanvas;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const ctx = this.trajectoryCtx;
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        // Clear canvas
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(0, 0, width, height);
+        
+        // Draw grid
         this.drawTrajectoryGrid();
-        // Draw target trajectory
-        let targetPath = trajectoryProgress.target_path || (trajectoryProgress.info && trajectoryProgress.info.target_path);
-        if (Array.isArray(targetPath) && targetPath.length > 0) {
-            ctx.strokeStyle = '#667eea';
+        
+        // Draw target path (dashed line)
+        if (trajectoryProgress.target_path && trajectoryProgress.target_path.length > 1) {
+            ctx.strokeStyle = '#d4af37';
             ctx.lineWidth = 2;
             ctx.setLineDash([5, 5]);
             ctx.beginPath();
-            targetPath.forEach((point, index) => {
-                const x = (point.valence + 1) * canvas.width / 2;
-                const y = (1 - point.arousal) * canvas.height / 2;
-                if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-            });
+            
+            for (let i = 0; i < trajectoryProgress.target_path.length; i++) {
+                const point = trajectoryProgress.target_path[i];
+                const x = (point.valence + 1) * width / 2;
+                const y = (1 - point.arousal) * height / 2;
+                
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            
             ctx.stroke();
-        }
-        // Draw actual trajectory
-        let actualPath = trajectoryProgress.actual_path || (trajectoryProgress.info && trajectoryProgress.info.actual_path);
-        if (Array.isArray(actualPath) && actualPath.length > 0) {
-            ctx.strokeStyle = '#4ecdc4';
-            ctx.lineWidth = 3;
             ctx.setLineDash([]);
+        }
+        
+        // Draw actual path
+        if (trajectoryProgress.actual_path && trajectoryProgress.actual_path.length > 1) {
+            ctx.strokeStyle = '#8b0000';
+            ctx.lineWidth = 3;
             ctx.beginPath();
-            actualPath.forEach((point, index) => {
-                const x = (point.valence + 1) * canvas.width / 2;
-                const y = (1 - point.arousal) * canvas.height / 2;
-                if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-            });
+            
+            for (let i = 0; i < trajectoryProgress.actual_path.length; i++) {
+                const point = trajectoryProgress.actual_path[i];
+                const x = (point.valence + 1) * width / 2;
+                const y = (1 - point.arousal) * height / 2;
+                
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            
             ctx.stroke();
         }
-        // Update deviation info if present
-        if (typeof trajectoryProgress.deviation === 'number') {
-            document.getElementById('trajectoryDeviation').textContent = trajectoryProgress.deviation.toFixed(3);
-        } else if (trajectoryProgress.info && typeof trajectoryProgress.info.deviation === 'number') {
-            document.getElementById('trajectoryDeviation').textContent = trajectoryProgress.info.deviation.toFixed(3);
+        
+        // Draw current position
+        if (trajectoryProgress.actual_path && trajectoryProgress.actual_path.length > 0) {
+            const currentPoint = trajectoryProgress.actual_path[trajectoryProgress.actual_path.length - 1];
+            const x = (currentPoint.valence + 1) * width / 2;
+            const y = (1 - currentPoint.arousal) * height / 2;
+            
+            ctx.fillStyle = '#d4af37';
+            ctx.beginPath();
+            ctx.arc(x, y, 6, 0, 2 * Math.PI);
+            ctx.fill();
         }
     }
     
     drawTrajectoryGrid() {
-        const ctx = this.trajectoryCtx;
         const canvas = this.trajectoryCanvas;
+        const ctx = this.trajectoryCtx;
+        const width = canvas.width;
+        const height = canvas.height;
         
-        ctx.strokeStyle = '#e0e0e0';
+        ctx.strokeStyle = '#404040';
         ctx.lineWidth = 1;
         
-        // Draw grid lines
-        const centerX = canvas.width / 2;
-        const centerY = canvas.height / 2;
+        // Vertical lines
+        for (let i = 0; i <= 4; i++) {
+            const x = (i / 4) * width;
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, height);
+            ctx.stroke();
+        }
         
-        // Vertical center line
-        ctx.beginPath();
-        ctx.moveTo(centerX, 0);
-        ctx.lineTo(centerX, canvas.height);
-        ctx.stroke();
-        
-        // Horizontal center line
-        ctx.beginPath();
-        ctx.moveTo(0, centerY);
-        ctx.lineTo(canvas.width, centerY);
-        ctx.stroke();
-        
-        // Add labels
-        ctx.fillStyle = '#666';
-        ctx.font = '12px Arial';
-        ctx.textAlign = 'center';
-        
-        ctx.fillText('Positive', canvas.width - 30, centerY - 5);
-        ctx.fillText('Negative', 30, centerY - 5);
-        ctx.fillText('High Arousal', centerX, 15);
-        ctx.fillText('Low Arousal', centerX, canvas.height - 5);
+        // Horizontal lines
+        for (let i = 0; i <= 4; i++) {
+            const y = (i / 4) * height;
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(width, y);
+            ctx.stroke();
+        }
     }
     
     updateMusicParameters(musicParams) {
-        console.log('[EmoTune] updateMusicParameters called:', musicParams);
-        if (!musicParams) return;
+        console.log('Updating music parameters:', musicParams);
+        
         // Update tempo
-        if (musicParams.tempo !== undefined) {
-            document.getElementById('tempoValue').textContent = Math.round(musicParams.tempo);
-        } else if (musicParams.tempo_bpm !== undefined) {
+        if (musicParams.tempo_bpm) {
             document.getElementById('tempoValue').textContent = Math.round(musicParams.tempo_bpm);
-        } else {
-            document.getElementById('tempoValue').textContent = '-';
         }
-        // Update key
-        if (musicParams.key) {
-            document.getElementById('keyValue').textContent = musicParams.key;
-        } else if (musicParams.scale) {
-            document.getElementById('keyValue').textContent = musicParams.scale;
-        } else {
-            document.getElementById('keyValue').textContent = '-';
-        }
-        // Update parameter bars (handle undefined gracefully)
-        this.updateParameterBar('rhythmComplexity', musicParams.rhythm_complexity);
-        this.updateParameterBar('harmonicComplexity', musicParams.chord_complexity);
-        this.updateParameterBar('textureDensity', musicParams.voice_density);
-        this.updateParameterBar('volumeLevel', musicParams.volume || musicParams.overall_volume);
-        // Add all other music parameters for debugging/visibility
-        const debugDiv = document.getElementById('musicParamDebug');
-        if (debugDiv) {
-            debugDiv.innerHTML = '<b>All Music Parameters:</b><br>' + Object.entries(musicParams).map(([k,v]) => `${k}: ${v}`).join('<br>');
-        }
+        
+        // Update parameter bars
+        this.updateParameterBar('rhythmComplexity', musicParams.rhythm_complexity || 0);
+        this.updateParameterBar('harmonicComplexity', musicParams.chord_complexity || 0);
+        this.updateParameterBar('textureDensity', musicParams.voice_density || 0);
+        this.updateParameterBar('volumeLevel', musicParams.overall_volume || 0);
+        
+        // Update key (simplified)
+        const keys = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+        const keyIndex = Math.floor((musicParams.brightness || 0.5) * keys.length);
+        document.getElementById('keyValue').textContent = keys[keyIndex] || 'C';
     }
     
     updateParameterBar(elementId, value) {
         const element = document.getElementById(elementId);
-        if (element && value !== undefined) {
-            const percentage = Math.max(0, Math.min(100, value * 100));
-            element.style.width = `${percentage}%`;
+        if (element) {
+            element.style.width = `${value * 100}%`;
         }
     }
     
     updateSessionUI(active) {
+        const sessionInfo = document.getElementById('sessionInfo');
         const startBtn = document.getElementById('startSessionBtn');
         const stopBtn = document.getElementById('stopSessionBtn');
-        const sessionInfo = document.getElementById('sessionInfo');
         
-        if (active && this.currentSession) {
+        if (active) {
+            sessionInfo.style.display = 'block';
             startBtn.disabled = true;
             stopBtn.disabled = false;
-            sessionInfo.style.display = 'block';
             
-            document.getElementById('currentGoal').textContent = 
-                this.currentSession.trajectory_type.replace('_', ' ').toUpperCase();
-            document.getElementById('currentDuration').textContent = 
-                `${Math.round(this.currentSession.duration / 60)} min`;
+            // Update session info
+            if (this.currentSession) {
+                document.getElementById('currentGoal').textContent = this.currentSession.trajectory_type;
+                document.getElementById('currentDuration').textContent = `${this.currentSession.duration} minutes`;
+            }
+            
+            // Start progress updates
+            this.updateSessionProgress();
         } else {
+            sessionInfo.style.display = 'none';
             startBtn.disabled = false;
             stopBtn.disabled = true;
-            sessionInfo.style.display = 'none';
-            
-            // Clear intervals
-            if (this.emotionCaptureInterval) {
-                clearInterval(this.emotionCaptureInterval);
-            }
-            if (this.progressInterval) {
-                clearInterval(this.progressInterval);
-            }
         }
     }
     
@@ -463,63 +686,58 @@ class EmoTuneClient {
         if (!this.currentSession) return;
         
         const elapsed = (Date.now() - this.currentSession.startTime) / 1000;
-        const progress = Math.min(100, (elapsed / this.currentSession.duration) * 100);
+        const totalSeconds = this.currentSession.duration * 60;
+        const progress = Math.min((elapsed / totalSeconds) * 100, 100);
         
-        document.getElementById('sessionProgress').style.width = `${progress}%`;
-        document.getElementById('progressText').textContent = `${Math.round(progress)}%`;
+        const progressFill = document.getElementById('sessionProgress');
+        const progressText = document.getElementById('progressText');
         
-        if (progress >= 100) {
-            this.stopSession();
+        progressFill.style.width = `${progress}%`;
+        progressText.textContent = `${Math.round(progress)}%`;
+        
+        if (progress < 100) {
+            setTimeout(() => this.updateSessionProgress(), 1000);
         }
     }
     
-    selectRating(button) {
-        // Remove selection from all rating buttons
+    selectRating(selectedBtn) {
         document.querySelectorAll('.rating-btn').forEach(btn => {
             btn.classList.remove('selected');
         });
-        
-        // Add selection to clicked button
-        button.classList.add('selected');
+        selectedBtn.classList.add('selected');
+        this.selectedRating = parseInt(selectedBtn.dataset.rating);
     }
     
     async submitFeedback() {
-        const selectedRating = document.querySelector('.rating-btn.selected');
-        const comfort = document.getElementById('comfortSlider').value;
-        const effectiveness = document.getElementById('effectivenessSlider').value;
-        const comments = document.getElementById('feedbackComments').value;
+        const rating = this.selectedRating;
+        const comfort = parseInt(document.getElementById('comfortSlider').value);
+        const effectiveness = parseInt(document.getElementById('effectivenessSlider').value);
         
-        if (!selectedRating) {
-            this.showNotification('Please select a rating', 'warning');
+        if (rating === 0) {
+            this.showGothicNotification('Please select an emotional state rating', 'error');
             return;
         }
-        
-        const feedbackData = {
-            rating: parseInt(selectedRating.dataset.rating),
-            comfort: parseInt(comfort),
-            effectiveness: parseInt(effectiveness),
-            comments: comments,
-            timestamp: Date.now()
-        };
         
         try {
             const response = await fetch('/feedback', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(feedbackData)
+                body: JSON.stringify({
+                    rating: rating,
+                    comfort: comfort,
+                    effectiveness: effectiveness,
+                    emotion_state: this.emotionState // Send current emotion state
+                })
             });
             
-            const data = await response.json();
-            
-            if (data.success) {
-                this.showNotification('Feedback submitted successfully', 'success');
-                this.clearFeedbackForm();
+            if (response.ok) {
+                this.showGothicNotification('Feedback submitted successfully', 'success');
             } else {
-                this.showNotification(data.error || 'Failed to submit feedback', 'error');
+                const errorData = await response.json();
+                this.showGothicNotification(`Failed to submit feedback: ${errorData.message}`, 'error');
             }
         } catch (error) {
-            console.error('Error submitting feedback:', error);
-            this.showNotification('Failed to submit feedback', 'error');
+            this.showGothicNotification(`Error: ${error.message}`, 'error');
         }
     }
     
@@ -527,95 +745,170 @@ class EmoTuneClient {
         document.querySelectorAll('.rating-btn').forEach(btn => {
             btn.classList.remove('selected');
         });
+        
         document.getElementById('comfortSlider').value = 5;
-        document.getElementById('comfortValue').textContent = '5';
         document.getElementById('effectivenessSlider').value = 5;
+        document.getElementById('comfortValue').textContent = '5';
         document.getElementById('effectivenessValue').textContent = '5';
-        document.getElementById('feedbackComments').value = '';
+        
+        this.rlFeedback.explicit.rating = 0;
     }
     
     playMusic() {
-        if (!this.isConnected) return;
         this.socket.emit('music_control', { action: 'play' });
-        this.showNotification('Music playback started', 'success');
+        this.showGothicNotification('Music playback started', 'info');
     }
-
+    
     pauseMusic() {
-        if (!this.isConnected) return;
         this.socket.emit('music_control', { action: 'pause' });
-        this.showNotification('Music paused', 'info');
+        this.showGothicNotification('Music paused', 'info');
     }
-
+    
     generateMusic() {
-        if (!this.isConnected) return;
         this.socket.emit('music_control', { action: 'regenerate' });
-        this.showNotification('Generating new music...', 'info');
+        this.showGothicNotification('Regenerating music parameters', 'info');
     }
-
-    requestMusicParameters() {
-        if (!this.isConnected) return;
-        this.socket.emit('request_music_parameters');
-    }
-
-    requestTrajectoryInfo() {
-        if (!this.isConnected) return;
-        this.socket.emit('request_trajectory_info');
-    }
-
-    showNotification(message, type = 'info') {
-        // Create notification element
+    
+    showGothicNotification(message, type = 'info') {
+        // Create gothic notification
         const notification = document.createElement('div');
-        notification.className = `notification notification-${type}`;
-        notification.textContent = message;
+        notification.className = `gothic-notification gothic-notification-${type}`;
+        notification.innerHTML = `
+            <div class="notification-content">
+                <i class="fas fa-${this.getNotificationIcon(type)}"></i>
+                <span>${message}</span>
+            </div>
+        `;
         
-        // Style the notification
-        Object.assign(notification.style, {
-            position: 'fixed',
-            top: '20px',
-            right: '20px',
-            padding: '15px 20px',
-            borderRadius: '8px',
-            color: 'white',
-            fontWeight: '600',
-            zIndex: '9999',
-            transform: 'translateX(100%)',
-            transition: 'transform 0.3s ease'
-        });
-        
-        // Set background color based on type
-        const colors = {
-            success: '#4ecdc4',
-            error: '#ff6b6b',
-            warning: '#ffe66d',
-            info: '#667eea'
-        };
-        notification.style.backgroundColor = colors[type] || colors.info;
-        
-        // Add to DOM and animate in
+        // Add to page
         document.body.appendChild(notification);
+        
+        // Animate in
         setTimeout(() => {
-            notification.style.transform = 'translateX(0)';
+            notification.classList.add('show');
         }, 100);
         
-        // Remove after 3 seconds
+        // Remove after delay
         setTimeout(() => {
-            notification.style.transform = 'translateX(100%)';
+            notification.classList.remove('show');
             setTimeout(() => {
-                if (notification.parentNode) {
-                    notification.parentNode.removeChild(notification);
-                }
+                document.body.removeChild(notification);
             }, 300);
         }, 3000);
     }
     
+    getNotificationIcon(type) {
+        switch (type) {
+            case 'success': return 'check-circle';
+            case 'error': return 'exclamation-triangle';
+            case 'warning': return 'exclamation-circle';
+            default: return 'info-circle';
+        }
+    }
+    
     updateUI() {
-        // Initial UI state
-        this.updateSessionUI(false);
+        // Initial UI setup
         this.updateConnectionStatus(false);
+        this.updateMediaStatus('initializing');
     }
 }
 
-// Initialize EmoTune client when DOM is loaded
+// Initialize the gothic client when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    window.emotuneClient = new EmoTuneClient();
+    window.emotuneClient = new EmoTuneGothicClient();
 });
+
+// Add gothic notification styles
+const gothicNotificationStyles = `
+<style>
+.gothic-notification {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    background: linear-gradient(135deg, #2d2d2d 0%, #1a1a1a 100%);
+    border: 2px solid #404040;
+    border-radius: 8px;
+    padding: 15px 20px;
+    color: #e0e0e0;
+    font-family: 'Crimson Text', serif;
+    z-index: 1000;
+    transform: translateX(100%);
+    transition: transform 0.3s ease;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+}
+
+.gothic-notification.show {
+    transform: translateX(0);
+}
+
+.gothic-notification-success {
+    border-color: #2d5a2d;
+}
+
+.gothic-notification-error {
+    border-color: #8b0000;
+}
+
+.gothic-notification-warning {
+    border-color: #5a4a2d;
+}
+
+.gothic-notification-info {
+    border-color: #2d4a5a;
+}
+
+.notification-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.notification-content i {
+    font-size: 1.2rem;
+}
+
+.gothic-notification-success .notification-content i {
+    color: #4a7c4a;
+}
+
+.gothic-notification-error .notification-content i {
+    color: #8b0000;
+}
+
+.gothic-notification-warning .notification-content i {
+    color: #7c6a4a;
+}
+
+.gothic-notification-info .notification-content i {
+    color: #4a6a7c;
+}
+[data-tooltip] {
+    position: relative;
+    cursor: help;
+}
+[data-tooltip]::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: #1a1a1a;
+    color: #e0e0e0;
+    border: 1px solid #d4af37;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    z-index: 10;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.2s, visibility 0.2s;
+}
+[data-tooltip]:hover::after {
+    opacity: 1;
+    visibility: visible;
+}
+</style>
+`;
+
+document.head.insertAdjacentHTML('beforeend', gothicNotificationStyles);

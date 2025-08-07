@@ -1,57 +1,73 @@
 # config/music_params.py
 
 from typing import Dict
-from emotune.core.music.parameter_space import ParameterRange, MusicParam
+from emotune.core.music.parameter_space import ParameterSpec, MusicParam
 
 
-MUSIC_PARAMETERS: Dict[str, ParameterRange] = {
-    "tempo": ParameterRange(
+MUSIC_PARAMETERS: Dict[str, ParameterSpec] = {
+    "tempo": ParameterSpec(
         min_val=60.0,
         max_val=180.0,
         default=120.0,
-        description="Beats per minute (BPM)"
+        therapeutic_min=70.0,
+        therapeutic_max=160.0,
+        clinical_notes="Therapeutic range avoids bradycardic/tachycardic entrainment effects"
     ),
-    "density": ParameterRange(
+    "density": ParameterSpec(
         min_val=0.0,
         max_val=1.0,
         default=0.5,
-        description="Note density or rhythmic activity"
+        therapeutic_min=0.1,
+        therapeutic_max=0.8,
+        clinical_notes="Note density affects cognitive load and engagement"
     ),
-    "brightness": ParameterRange(
+    "brightness": ParameterSpec(
         min_val=0.0,
         max_val=1.0,
         default=0.5,
-        description="Timbre brightness, e.g., high-pass filtering"
+        therapeutic_min=0.2,
+        therapeutic_max=0.9,
+        clinical_notes="Brightness correlates with perceived energy and hope"
     ),
-    "volume": ParameterRange(
+    "volume": ParameterSpec(
         min_val=0.0,
         max_val=1.0,
         default=0.7,
-        description="Overall loudness (dynamics)"
+        therapeutic_min=0.2,
+        therapeutic_max=0.8,
+        clinical_notes="Volume limits prevent startle response and hearing damage"
     ),
-    "reverb": ParameterRange(
+    "reverb": ParameterSpec(
         min_val=0.0,
         max_val=1.0,
         default=0.3,
-        description="Amount of reverb (spatialization)"
+        therapeutic_min=0.0,
+        therapeutic_max=0.7,
+        clinical_notes="Reverb creates spaciousness but excessive amounts can feel isolating"
     ),
-    "harmonicity": ParameterRange(
+    "harmonicity": ParameterSpec(
         min_val=0.0,
         max_val=1.0,
         default=0.5,
-        description="Consonance/dissonance ratio in harmony"
+        therapeutic_min=0.1,
+        therapeutic_max=0.8,
+        clinical_notes="Consonance/dissonance ratio affects emotional perception"
     ),
-    "texture": ParameterRange(
+    "texture": ParameterSpec(
         min_val=0.0,
         max_val=1.0,
         default=0.5,
-        description="Polyphonic texture complexity"
+        therapeutic_min=0.1,
+        therapeutic_max=0.8,
+        clinical_notes="Texture complexity affects cognitive processing"
     ),
-    "attack_time": ParameterRange(
+    "attack_time": ParameterSpec(
         min_val=0.01,
         max_val=1.0,
         default=0.1,
-        description="Envelope attack time for notes"
+        therapeutic_min=0.02,
+        therapeutic_max=0.8,
+        clinical_notes="Attack time affects perceived articulation and energy"
     )
 }
 

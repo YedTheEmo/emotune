@@ -8,57 +8,71 @@ class FeedbackProcessor:
         self.learning_rate = 0.1
         self.reward_decay = 0.95
         
+    def process_feedback(self, session_id: str, feedback_data: Dict) -> Dict:
+        """
+        Analyzes user feedback and translates it into musical adjustments and an impact statement.
+        """
+        rating = feedback_data.get('rating', 3)  # Neutral default
+        comfort = feedback_data.get('comfort', 5)  # Neutral default
+        effectiveness = feedback_data.get('effectiveness', 5)  # Neutral default
+
+        adjustments = {}
+        impact_statements = []
+
+        # --- Analyze Effectiveness ---
+        if effectiveness < 4:
+            adjustments['repetition_factor'] = -0.15  # Reduce repetition
+            adjustments['rhythm_complexity'] = 0.1   # Increase complexity
+            impact_statements.append("You found the music ineffective, so the system will explore more varied and complex patterns.")
+        elif effectiveness > 7:
+            adjustments['repetition_factor'] = 0.15  # Increase repetition
+            impact_statements.append("You found the music effective, so the system will reinforce the current musical theme.")
+
+        # --- Analyze Comfort ---
+        if comfort < 4:
+            adjustments['dissonance_level'] = -0.2  # Reduce dissonance
+            adjustments['warmth'] = 0.15            # Increase warmth
+            impact_statements.append("You felt uncomfortable, so the music will be made less dissonant and warmer.")
+        elif comfort > 7:
+            adjustments['dissonance_level'] = 0.1  # Allow slightly more dissonance
+            impact_statements.append("You felt comfortable, so the system will maintain the current harmonic structure.")
+
+        # --- Analyze Overall Rating ---
+        if rating <= 2: # Negative or Very Negative
+            adjustments['tempo_bpm'] = -10         # Slow down
+            adjustments['brightness'] = -0.1       # Make it darker
+            impact_statements.append("Based on your negative rating, the tempo and brightness will be lowered.")
+        elif rating >= 4: # Positive or Very Positive
+            adjustments['tempo_bpm'] = 10          # Speed up
+            adjustments['brightness'] = 0.1        # Make it brighter
+            impact_statements.append("Based on your positive rating, the tempo and brightness will be increased.")
+
+        if not impact_statements:
+            impact_statement = "Your feedback is neutral. The system will continue with the current musical direction."
+        else:
+            impact_statement = " ".join(impact_statements)
+
+        return {
+            "adjustments": adjustments,
+            "impact_statement": impact_statement
+        }
+        
     def compute_reward_signal(self, trajectory_deviation: float, 
                             emotion_stability: float) -> float:
-        """Compute reward signal for RL training using only explicit and implicit feedback."""
+        """Compute reward signal for RL training."""
         feedback_score, feedback_confidence = self.collector.get_recent_feedback_score()
         
-        # Trajectory adherence reward (negative deviation is good)
-        trajectory_reward = -trajectory_deviation
+        # Trajectory adherence reward (lower deviation is better)
+        trajectory_reward = 1.0 - trajectory_deviation
         
-        # Emotion stability reward (less variance is good for therapeutic goals)
-        stability_reward = -emotion_stability
+        # Emotion stability reward (lower variance is good)
+        stability_reward = 1.0 - emotion_stability
         
-        # User feedback reward
+        # User feedback reward, weighted by confidence
         user_reward = feedback_score * feedback_confidence
         
-        # Combine rewards with weights from the framework
-        alpha, beta, gamma = 0.4, 0.5, 0.1
-        total_reward = alpha * trajectory_reward + beta * user_reward + gamma * stability_reward
+        # Combine rewards
+        total_reward = (0.4 * trajectory_reward) + (0.5 * user_reward) + (0.1 * stability_reward)
         
-        return np.clip(total_reward, -2.0, 2.0)
-    
-    def process_feedback_for_learning(self) -> Dict[str, float]:
-        """Process feedback to extract learning signals (explicit/implicit only)."""
-        recent_feedback = self.collector.current_session_feedback[-10:]  # Last 10 feedback events
+        return np.clip(total_reward, -1.0, 1.0)
         
-        if not recent_feedback:
-            return {"reward": 0.0, "confidence": 0.0, "trend": 0.0}
-        
-        # Only use explicit and implicit feedback
-        filtered_feedback = [fb for fb in recent_feedback if fb.feedback_type in (FeedbackType.EXPLICIT_RATING, FeedbackType.IMPLICIT_INTERACTION)]
-        
-        # Calculate trend in feedback
-        trend = 0.0
-        if len(filtered_feedback) >= 2:
-            values = [fb.value for fb in filtered_feedback]
-            trend = (values[-1] - values[0]) / len(values)
-        
-        # Overall reward signal
-        total_reward = sum(fb.value * self.feedback_weights.get(fb.feedback_type, 0.0) for fb in filtered_feedback)
-        avg_reward = total_reward / len(filtered_feedback) if filtered_feedback else 0.0
-        
-        # Confidence based on feedback consistency
-        values = [fb.value for fb in filtered_feedback]
-        confidence = 1.0 / (1.0 + np.std(values)) if len(values) > 1 else 0.5
-        
-        return {
-            "reward": avg_reward,
-            "confidence": confidence,
-            "trend": trend,
-            "feedback_count": len(filtered_feedback)
-        }
-    
-    @property
-    def feedback_weights(self):
-        return self.collector.feedback_weights

@@ -35,7 +35,13 @@ def create_app(db):
 
     logger.info("[create_app] STEP 3: Assigning database reference")
     data_persistence = db
+    
+    # Initialize session tracking variables
+    session_uuid_to_sid = {}
+    sid_to_session_uuid = {}
 
+    # Try to initialize SessionManager, but fall back gracefully
+    session_manager = None
     try:
         logger.info("[create_app] STEP 4: Initializing SessionManager")
         session_config_fields = {f.name for f in fields(SessionConfig)}
@@ -45,12 +51,33 @@ def create_app(db):
         }
         session_cfg = SessionConfig(**filtered_session_cfg)
         
-        session_manager = SessionManager(config=session_cfg, db=db, app=app, socketio=socketio)
-        logger.info("[create_app] STEP 5: SessionManager initialized")
+        # Create parameter space for SessionManager
+        from emotune.core.music.parameter_space import MusicParameterSpace
+        param_space = MusicParameterSpace()
+        
+        # Try to import and create SessionManager
+        try:
+            from emotune.core.session.manager import SessionManager
+            # Use positional arguments to avoid any parameter issues
+            session_manager = SessionManager(session_cfg, db, app, socketio, param_space)
+        except Exception as main_error:
+            logger.error(f"Main SessionManager failed: {main_error}")
+            # Try working SessionManager
+            from emotune.core.session.working_manager import WorkingSessionManager
+            session_manager = WorkingSessionManager(session_cfg, db, app, socketio, param_space)
+        logger.info("[create_app] STEP 5: SessionManager initialized successfully")
         logger.info("EmoTune system initialized successfully")
     except Exception as e:
         logger.error(f"[create_app] ERROR during SessionManager init: {e}")
-        session_manager = None
+        logger.error(f"[create_app] Creating fallback SessionManager")
+        # Create a fallback SessionManager
+        try:
+            from emotune.core.session.fallback_manager import FallbackSessionManager
+            session_manager = FallbackSessionManager(config=session_cfg, db=db, app=app, socketio=socketio, param_space=param_space)
+            logger.info("[create_app] Fallback SessionManager initialized successfully")
+        except Exception as fallback_error:
+            logger.error(f"[create_app] Fallback SessionManager also failed: {fallback_error}")
+            session_manager = None
 
     logger.info("[create_app] STEP 6: Registering routes")
 
@@ -66,11 +93,17 @@ def create_app(db):
 
     @app.route('/session/start', methods=['POST'])
     def start_session():
-        data = request.get_json()
-        trajectory_type = data.get('trajectory_type', 'calm_down')
-        duration = int(data.get('duration', 300))
-
         try:
+            if not session_manager:
+                return jsonify({
+                    'success': False,
+                    'error': 'Session manager not available'
+                }), 500
+                
+            data = request.get_json()
+            trajectory_type = data.get('trajectory_type', 'calm_down')
+            duration = int(data.get('duration', 300))
+
             session_id = session_manager.start_session(trajectory_type, duration)
             session['session_id'] = session_id
             # Emit session status to frontend
@@ -81,6 +114,7 @@ def create_app(db):
                 'message': 'Session started'
             })
         except Exception as e:
+            logger.error(f"Error starting session: {e}")
             socketio.emit('error', {'message': str(e)})
             return jsonify({
                 'success': False,
@@ -90,8 +124,20 @@ def create_app(db):
     @app.route('/session/stop', methods=['POST'])
     def stop_session():
         sid = session.get('session_id')
+        logger.info(f"[stop_session] Flask session contains: {dict(session)}")
+        logger.info(f"[stop_session] Looking for session_id, found: {sid}")
+        
         if not sid:
-            return jsonify({'success': False, 'error': 'No active session'}), 400
+            # Check if we have a session manager with a current session
+            if session_manager and hasattr(session_manager, '_current_session_id') and session_manager._current_session_id:
+                sid = session_manager._current_session_id
+                logger.info(f"[stop_session] Using session_id from session_manager: {sid}")
+            elif session_manager and hasattr(session_manager, 'current_session_id') and session_manager.current_session_id:
+                sid = session_manager.current_session_id
+                logger.info(f"[stop_session] Using current_session_id from session_manager: {sid}")
+            else:
+                logger.warning("[stop_session] No active session found in Flask session or session manager")
+                return jsonify({'success': False, 'error': 'No active session'}), 400
 
         try:
             session_manager.stop_session(sid)
@@ -100,6 +146,7 @@ def create_app(db):
             socketio.emit('session_status', {'active': False, 'session_id': sid})
             return jsonify({'success': True, 'message': 'Session stopped'})
         except Exception as e:
+            logger.error(f"Error stopping session: {e}")
             socketio.emit('error', {'message': str(e)})
             return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -143,9 +190,8 @@ def create_app(db):
                 'comments': data.get('comments', ''),
                 'emotion_state': data.get('emotion_state')
             }
-            session_manager.process_feedback(sid, feedback)
-            data_persistence.save_feedback(sid, feedback)
-            logger.info(f"[POST /feedback] Feedback saved for session: {sid}")
+            session_manager.process_realtime_feedback(sid, feedback)
+            logger.info(f"[POST /feedback] Feedback processed for session: {sid}")
             return jsonify({'success': True, 'message': 'Feedback submitted'})
         except Exception as e:
             logger.error(f"Failed to submit feedback: {e}")
@@ -158,20 +204,15 @@ def create_app(db):
     @socketio.on('connect')
     def on_connect():
         logger.info(f"[SocketIO] Client connected: {request.sid}")
-        emit('connected', {'message': 'Connected'})
+        # Set the SocketIO SID immediately when client connects
+        session_manager.set_socketio_sid(request.sid)
+        emit('connected', {'message': 'Connected to EmoTune server'})
 
     @socketio.on('disconnect')
     def on_disconnect():
         logger.info(f"[SocketIO] Client disconnected: {request.sid}")
-        # Remove from mapping if present
-        uuid_to_remove = None
-        for uuid, sid in session_uuid_to_sid.items():
-            if sid == request.sid:
-                uuid_to_remove = uuid
-                break
-        if uuid_to_remove:
-            del session_uuid_to_sid[uuid_to_remove]
-            del sid_to_session_uuid[request.sid]
+        # Clear the SocketIO SID when client disconnects
+        session_manager.set_socketio_sid(None)
 
     @socketio.on('start_emotion_monitoring')
     def on_start_monitoring():
@@ -202,26 +243,63 @@ def create_app(db):
             else:
                 sid = session.get('session_id')
             logger.info(f"[SocketIO] Processing emotion data for session: {sid}")
-            res = session_manager.process_emotion_data(sid, data)
+            
+            # Extract actual emotion data from the payload
+            emotion_data = data.get('emotion_data', data) if isinstance(data, dict) else data
+            
+            # Ensure we have proper emotion data structure
+            if isinstance(emotion_data, (int, float)):
+                # If we got a timestamp, create default emotion structure
+                logger.warning(f"Received timestamp instead of emotion data: {emotion_data}")
+                emotion_data = {
+                    'mean': {'valence': 0.0, 'arousal': 0.5},
+                    'confidence': 0.5,
+                    'timestamp': emotion_data
+                }
+            elif not isinstance(emotion_data, dict):
+                # If we got something unexpected, create default structure
+                logger.warning(f"Received unexpected emotion data type: {type(emotion_data)}")
+                emotion_data = {
+                    'mean': {'valence': 0.0, 'arousal': 0.5},
+                    'confidence': 0.5,
+                    'timestamp': time.time()
+                }
+            
+            res = session_manager.process_emotion_data(sid, emotion_data)
             logger.info(f"[SocketIO] process_emotion_data result: {res}")
+            
             # Get trajectory progress for visualization
-            info = session_manager.trajectory_planner.get_trajectory_info()
-            logger.info(f"[SocketIO] Trajectory info: {info}")
-            actual_path = data_persistence.get_emotion_history(sid)
+            try:
+                info = session_manager.trajectory_planner.get_trajectory_info()
+                logger.info(f"[SocketIO] Trajectory info: {info}")
+            except Exception as e:
+                logger.error(f"Error getting trajectory info: {e}")
+                info = {'target': None, 'deviation': 0.0}
+            
+            try:
+                actual_path = data_persistence.get_emotion_history(sid)
+            except Exception as e:
+                logger.error(f"Error getting emotion history: {e}")
+                actual_path = []
             logger.info(f"[SocketIO] Actual emotion path: {actual_path}")
             actual_points = [
                 {'valence': p['mean']['valence'], 'arousal': p['mean']['arousal'], 'timestamp': p['timestamp']}
                 for p in actual_path
             ] if actual_path else []
-            if actual_points and info['target']:
+            if actual_points and info.get('target'):
                 logger.info(f"[SocketIO] Actual points and target present. Generating target points.")
-                target_fn = session_manager.trajectory_planner.current_trajectory
-                start_time = session_manager.trajectory_planner.start_time
+                try:
+                    target_fn = session_manager.trajectory_planner.current_trajectory
+                    start_time = session_manager.trajectory_planner.start_time
+                except Exception as e:
+                    logger.error(f"Error getting trajectory function: {e}")
+                    target_fn = lambda t: (0.0, 0.0)
+                    start_time = time.time()
                 target_points = []
                 for p in actual_points:
                     try:
                         result = target_fn(p['timestamp'] - start_time)
-                        logger.info(f"[SocketIO] target_fn({p['timestamp'] - start_time}) returned: {result} (type: {type(result)})")
+                        logger.debug(f"[SocketIO] target_fn({p['timestamp'] - start_time}) returned: {result}")
                         if isinstance(result, (list, tuple)) and len(result) >= 2:
                             valence, arousal = result[0], result[1]
                         else:
@@ -234,7 +312,15 @@ def create_app(db):
             else:
                 logger.info(f"[SocketIO] Actual points or target missing. No target points generated.")
                 target_points = []
-            deviation = info.get('deviation', None)
+            # Get trajectory progress from session manager
+            try:
+                trajectory_progress = session_manager._get_trajectory_progress()
+                deviation = trajectory_progress.get('deviation', None)
+                logger.info(f"[SocketIO] Deviation from session manager: {deviation}")
+            except Exception as e:
+                logger.error(f"Error getting trajectory progress: {e}")
+                deviation = None
+            
             logger.info(f"[SocketIO] Deviation: {deviation}")
             logger.info(f"[SocketIO] Emitting emotion_update event with music_parameters: {res.get('music_parameters')}")
             # Use the real SocketIO sid for emits
@@ -340,22 +426,43 @@ def create_app(db):
     @socketio.on('music_control')
     def on_music_control(data):
         logger.info(f"[SocketIO] Music control: {data}")
-        sid = session.get('session_id')
-        if not sid:
-            emit('error', {'message': 'No active session'})
-            return
-        action = data.get('action')
-        if action == 'play':
-            session_manager.play_music()
-            emit('music_status', {'status': 'playing'})
-        elif action == 'pause':
-            session_manager.pause_music()
-            emit('music_status', {'status': 'paused'})
-        elif action == 'regenerate':
-            session_manager.regenerate_music()
-            emit('music_status', {'status': 'regenerated'})
-        else:
-            emit('error', {'message': 'Unknown music control action'})
+        try:
+            if not session_manager:
+                emit('error', {'message': 'Session manager not available'})
+                return
+            
+            # Allow music controls even without active session
+            sid = session.get('session_id')
+            if not sid:
+                logger.info("[SocketIO] No active session, but allowing music control")
+                
+            action = data.get('action')
+            if action == 'play':
+                try:
+                    session_manager.play_music()
+                    emit('music_status', {'status': 'playing'})
+                except Exception as e:
+                    logger.error(f"Error playing music: {e}")
+                    emit('error', {'message': f'Failed to play music: {str(e)}'})
+            elif action == 'pause':
+                try:
+                    session_manager.pause_music()
+                    emit('music_status', {'status': 'paused'})
+                except Exception as e:
+                    logger.error(f"Error pausing music: {e}")
+                    emit('error', {'message': f'Failed to pause music: {str(e)}'})
+            elif action == 'regenerate':
+                try:
+                    session_manager.regenerate_music()
+                    emit('music_status', {'status': 'regenerated'})
+                except Exception as e:
+                    logger.error(f"Error regenerating music: {e}")
+                    emit('error', {'message': f'Failed to regenerate music: {str(e)}'})
+            else:
+                emit('error', {'message': 'Unknown music control action'})
+        except Exception as e:
+            logger.error(f"Error in music control: {e}")
+            emit('error', {'message': f'Music control error: {str(e)}'})
 
     @socketio.on('request_music_parameters')
     def on_request_music_parameters():
@@ -381,6 +488,88 @@ def create_app(db):
         logger.info(f"[SocketIO] session_ready received for session: {sid}")
         # Optionally, set a ready flag or perform any setup
         emit('session_ready_ack', {'session_id': sid})
+
+    @socketio.on('update_confidence_thresholds')
+    def on_update_confidence_thresholds(data):
+        logger.info(f"[SocketIO] Confidence thresholds received: {data}")
+        if session_manager:
+            session_manager.update_confidence_thresholds(data)
+            emit('thresholds_updated', {'message': 'Confidence thresholds updated successfully'})
+        else:
+            emit('error', {'message': 'Session manager not available'})
+
+    @socketio.on('update_analysis_mode')
+    def on_update_analysis_mode(data):
+        logger.info(f"[SocketIO] Analysis mode received: {data}")
+        if session_manager:
+            session_manager.update_analysis_mode(data.get('mode'))
+            emit('mode_updated', {'message': 'Analysis mode updated successfully'})
+        else:
+            emit('error', {'message': 'Session manager not available'})
+
+    @socketio.on('start_session')
+    def on_start_session(data):
+        trajectory = data.get('trajectory', 'default')
+        duration = data.get('duration', 300)
+        sid = request.sid
+        session_id = session_manager.start_session(trajectory_type=trajectory, duration=duration)
+        session['session_id'] = session_id
+        logger.info(f"[SocketIO] Session started: {session_id} for SID: {sid}")
+        session_manager.play_music() # Start music automatically
+        emit('session_started', {'session_id': session_id})
+
+    @socketio.on('stop_session')
+    def on_stop_session():
+        sid = session.get('session_id')
+        logger.info(f"[SocketIO] Stopping session: {sid}")
+        if sid:
+            session_manager.stop_session(sid)
+            emit('session_stopped', {'session_id': sid})
+            session.pop('session_id', None)
+        else:
+            logger.warning("[SocketIO] No active session to stop.")
+
+    @socketio.on('play_music')
+    def on_play_music():
+        logger.info("[SocketIO] Play music request received")
+        if session_manager:
+            session_manager.play_music()
+
+    @socketio.on('pause_music')
+    def on_pause_music():
+        logger.info("[SocketIO] Pause music request received")
+        if session_manager:
+            session_manager.pause_music()
+
+    @socketio.on('regenerate_music')
+    def on_regenerate_music():
+        logger.info("[SocketIO] Regenerate music request received")
+        if session_manager:
+            session_manager.regenerate_music()
+
+    @socketio.on('submit_feedback')
+    def on_submit_feedback(data):
+        session_id = session.get('session_id')
+        logger.info(f"[SocketIO] Submitting feedback for session: {session_id}")
+        if not session_id:
+            emit('error', {'message': 'No active session'})
+            return
+        try:
+            feedback = {
+                'session_id': session_id,
+                'timestamp': datetime.now().isoformat(),
+                'rating': data.get('rating'),
+                'comfort': data.get('comfort'),
+                'effectiveness': data.get('effectiveness'),
+                'comments': data.get('comments', ''),
+                'emotion_state': data.get('emotion_state')
+            }
+            session_manager.process_realtime_feedback(session_id, feedback)
+            logger.info(f"[SocketIO] Feedback processed for session: {session_id}")
+            emit('feedback_submitted', {'message': 'Feedback submitted'})
+        except Exception as e:
+            logger.error(f"[SocketIO] Failed to submit feedback: {e}")
+            emit('error', {'message': f'Failed to submit feedback: {str(e)}'})
 
     @app.errorhandler(404)
     def not_found(e):

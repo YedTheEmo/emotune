@@ -149,6 +149,6 @@ class TrajectoryPlanner:
         }
     
     def _is_active(self) -> bool:
-        """Check if trajectory is currently active"""
-        return (self.status in [TrajectoryStatus.ACTIVE, TrajectoryStatus.ADAPTING] and
+        """Check if trajectory is currently active or completed for visualization."""
+        return (self.status in [TrajectoryStatus.ACTIVE, TrajectoryStatus.ADAPTING, TrajectoryStatus.COMPLETED] and
                 self.current_trajectory is not None)

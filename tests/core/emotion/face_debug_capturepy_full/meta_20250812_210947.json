@@ -1,0 +1,20 @@
+{
+  "timestamp": "20250812_210947",
+  "raw_frame": "C:\\Users\\xenomorph\\Desktop\\ForgeAux\\emotune\\tests\\core\\emotion\\face_debug_capturepy_full\\raw_20250812_210947.jpg",
+  "details": {
+    "detection_method": "mtcnn",
+    "bbox": [
+      233,
+      148,
+      451,
+      412
+    ],
+    "det_conf": 0.9998868703842163,
+    "saved_crop_path": "C:\\Users\\xenomorph\\Desktop\\ForgeAux\\emotune\\tests\\core\\emotion\\face_debug_capturepy_full\\crops\\face_crop_mtcnn_1755004187892.jpg"
+  },
+  "emotions": {
+    "valence": -0.41863322257995605,
+    "arousal": 0.2778817415237427
+  },
+  "confidence": 0.9101081132888793
+}

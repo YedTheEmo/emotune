@@ -47,6 +47,9 @@ class EmotionCapture:
             'audio_chunks': 0,
             'errors': 0
         }
+        # Last frame for preview streaming
+        self._last_frame = None
+        self._last_frame_lock = threading.Lock()
         
         # Audio configuration
         self._audio_device = None
@@ -80,6 +83,9 @@ class EmotionCapture:
             
         except Exception as e:
             logger.error(f"Error during final cleanup: {e}")
+        finally:
+            with self._last_frame_lock:
+                self._last_frame = None
 
     def _initialize_camera(self) -> bool:
         """Initialize camera with proper error handling and retry logic"""
@@ -299,6 +305,9 @@ class EmotionCapture:
             
         except Exception as e:
             logger.error(f"Error during camera cleanup: {e}")
+        finally:
+            with self._last_frame_lock:
+                self._last_frame = None
 
     def _clear_data_queue(self):
         """Clear all data from the queue"""
@@ -334,6 +343,12 @@ class EmotionCapture:
                     frame = self._capture_frame()
                     
                     if frame is not None:
+                        # Update last frame for preview
+                        try:
+                            with self._last_frame_lock:
+                                self._last_frame = frame.copy()
+                        except Exception:
+                            pass
                         # Put only frame data in the queue
                         data = {
                             'timestamp': current_time,
@@ -401,30 +416,36 @@ class EmotionCapture:
         try:
             with self._camera_lock:
                 ret, frame = self._camera.read()
-                
+            
             if not ret or frame is None:
                 return None
-                
+            
             # Validate frame
             if not isinstance(frame, np.ndarray):
                 return None
-                
+            
             if frame.ndim != 3 or frame.shape[2] != 3:
                 return None
-                
-            # Check for black frames
+            
+            # Check for black frames (relaxed) and log
             frame_mean = np.mean(frame)
-            if frame_mean < 10:  # Slightly higher threshold
+            frame_max = np.max(frame)
+            # Normalize mean/std to 0-1 range regardless of dtype/scale
+            norm_mean = float(frame_mean / 255.0) if frame_max > 1.5 else float(frame_mean)
+            norm_std = float((np.std(frame) / 255.0) if frame_max > 1.5 else np.std(frame))
+            # Drop only if nearly all-black and very low variance
+            if norm_mean < 0.02 and norm_std < 0.01:
+                logger.debug(f"[Capture] Dropping near-black frame: mean={norm_mean:.3f}, std={norm_std:.3f}")
                 return None
-                
-            # Convert BGR to RGB for model compatibility
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                logger.debug(f"[Capture] Captured frame: shape={frame.shape}, mean_norm={norm_mean:.3f}, std_norm={norm_std:.3f}")
             
             # Save debug frame occasionally
             if self._capture_stats['frames_captured'] % 30 == 0:  # Every 30 frames
                 self._save_debug_frame(frame)
-                
-            return frame_rgb
+            
+            # Return raw BGR frame; analyzer will handle color conversion
+            return frame
             
         except Exception as e:
             logger.error(f"Frame capture error: {e}")
@@ -476,6 +497,16 @@ class EmotionCapture:
     def get_stats(self) -> Dict:
         """Get capture statistics"""
         return self._capture_stats.copy()
+
+    def get_last_frame(self) -> Optional[np.ndarray]:
+        """Get the last captured BGR frame for preview streaming."""
+        with self._last_frame_lock:
+            if self._last_frame is None:
+                return None
+            try:
+                return self._last_frame.copy()
+            except Exception:
+                return None
 
     def start(self):
         """Compatibility method"""

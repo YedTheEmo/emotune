@@ -90,6 +90,36 @@ def create_app(db):
     def favicon():
         return app.send_static_file('favicon.ico')
 
+    # --- MJPEG video feed from backend capture ---
+    def _generate_mjpeg_frames():
+        import cv2
+        import time
+        while True:
+            try:
+                if session_manager and hasattr(session_manager, 'emotion_capture') and session_manager.emotion_capture:
+                    frame = session_manager.emotion_capture.get_last_frame()
+                else:
+                    frame = None
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
+                ok, buf = cv2.imencode('.jpg', frame)
+                if not ok:
+                    time.sleep(0.01)
+                    continue
+                jpg = buf.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpg + b'\r\n')
+            except GeneratorExit:
+                break
+            except Exception:
+                time.sleep(0.05)
+
+    @app.route('/video_feed')
+    def video_feed():
+        from flask import Response
+        return Response(_generate_mjpeg_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
     @app.route('/session/start', methods=['POST'])
     def start_session():
@@ -494,7 +524,7 @@ def create_app(db):
         logger.info(f"[SocketIO] Confidence thresholds received: {data}")
         if session_manager:
             session_manager.update_confidence_thresholds(data)
-            emit('thresholds_updated', {'message': 'Confidence thresholds updated successfully'})
+            emit('thresholds_updated', {'message': 'Confidence thresholds updated successfully', 'success': True})
         else:
             emit('error', {'message': 'Session manager not available'})
 
@@ -503,7 +533,16 @@ def create_app(db):
         logger.info(f"[SocketIO] Analysis mode received: {data}")
         if session_manager:
             session_manager.update_analysis_mode(data.get('mode'))
-            emit('mode_updated', {'message': 'Analysis mode updated successfully'})
+            emit('mode_updated', {'message': 'Analysis mode updated successfully', 'success': True})
+        else:
+            emit('error', {'message': 'Session manager not available'})
+
+    @socketio.on('update_fusion_options')
+    def on_update_fusion_options(data):
+        logger.info(f"[SocketIO] Fusion options received: {data}")
+        if session_manager:
+            session_manager.update_fusion_options(data)
+            emit('fusion_options_updated', {'message': 'Fusion options updated successfully', 'success': True})
         else:
             emit('error', {'message': 'Session manager not available'})
 

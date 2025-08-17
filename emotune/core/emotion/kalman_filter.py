@@ -71,13 +71,11 @@ class KalmanEmotionFilter:
         
         z = np.array([v, a])
         
-        # Adaptive measurement noise based on uncertainty
+        # Adaptive measurement noise based on uncertainty and confidence
         uncertainty = observation.get('uncertainty', 0.5)
-        R = self.R_default * (1.0 + uncertainty * 2.0)
-        
-        # --- NEW: Use confidence for covariance if provided ---
-        if confidence is not None and confidence > 0:
-            self.P[:2, :2] = np.diag([confidence, confidence])
+        conf = float(confidence) if confidence is not None else 0.5
+        conf = np.clip(conf, 0.0, 1.0)
+        R = self.R_default * (1.0 + uncertainty * 2.0) * (1.0 + (1.0 - conf) * 2.0)
         
         # Validity checks - FIXED: Use proper numpy methods instead of boolean array comparison
         if not (np.isfinite(v) and np.isfinite(a)):

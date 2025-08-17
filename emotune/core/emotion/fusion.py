@@ -17,6 +17,7 @@ class EmotionFusion:
         self.min_confidence_threshold = 0.1
         self.max_uncertainty = 0.9
         self.min_uncertainty = 0.1
+        self.allow_fallback_in_single_mode = True
         
         # Quality metrics
         self._fusion_history = []
@@ -26,6 +27,19 @@ class EmotionFusion:
         self.face_confidence_threshold = 0.5
         self.voice_confidence_threshold = 0.5
         self.analysis_mode = "fusion"  # fusion, face, or voice
+
+    def update_options(self, allow_fallback: Optional[bool] = None, fusion_min_conf: Optional[float] = None):
+        """Update fusion-level options such as fallback behavior and fusion min confidence."""
+        if allow_fallback is not None:
+            self.allow_fallback_in_single_mode = bool(allow_fallback)
+            logger.info(f"Updated fusion option: allow_fallback_in_single_mode={self.allow_fallback_in_single_mode}")
+        if fusion_min_conf is not None:
+            try:
+                val = float(fusion_min_conf)
+                self.min_confidence_threshold = float(np.clip(val, 0.0, 1.0))
+                logger.info(f"Updated fusion option: min_confidence_threshold={self.min_confidence_threshold}")
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid fusion_min_conf value: {fusion_min_conf}")
 
     def set_analysis_mode(self, mode: str):
         """Set the analysis mode."""
@@ -76,7 +90,7 @@ class EmotionFusion:
             'valence': float(fused_emotion['valence']),
             'arousal': float(fused_emotion['arousal']),
             'uncertainty': float(uncertainty),
-            'confidence': float(sum(confidences)),
+            'confidence': float(np.clip(fused_emotion.get('confidence', np.mean(confidences) if confidences else 0.0), 0.0, 1.0)),
             'sources': {
                 'face': face_data is not None and face_data.get('confidence', 0) > self.min_confidence_threshold,
                 'voice': voice_data is not None and voice_data.get('confidence', 0) > self.min_confidence_threshold
@@ -117,23 +131,50 @@ class EmotionFusion:
         weights = []
         confidences = []
 
+        # Helper to add a modality safely
+        def _add_modality(data):
+            em = data.get('emotions', {})
+            v = em.get('valence')
+            a = em.get('arousal')
+            if v is None or a is None:
+                return
+            # Clamp to valid range
+            v = float(np.clip(v, -1.0, 1.0))
+            a = float(np.clip(a, -1.0, 1.0))
+            c = float(np.clip(data.get('confidence', 0.0), 0.0, 1.0))
+            emotions.append({'valence': v, 'arousal': a})
+            weights.append(c)
+            confidences.append(c)
+
         if self.analysis_mode == "face" and face_data and face_data.get('confidence', 0) > self.face_confidence_threshold:
-            emotions.append(face_data['emotions'])
-            weights.append(face_data['confidence'])
-            confidences.append(face_data['confidence'])
+            _add_modality(face_data)
+        elif self.analysis_mode == "face" and (not emotions) and self.allow_fallback_in_single_mode:
+            # Fallback: if in face-only mode but face is missing/low, use voice if minimally confident
+            if voice_data and voice_data.get('confidence', 0) > self.min_confidence_threshold:
+                logger.debug("[Fusion] Face mode fallback: using voice due to insufficient face confidence")
+                _add_modality(voice_data)
         elif self.analysis_mode == "voice" and voice_data and voice_data.get('confidence', 0) > self.voice_confidence_threshold:
-            emotions.append(voice_data['emotions'])
-            weights.append(voice_data['confidence'])
-            confidences.append(voice_data['confidence'])
+            _add_modality(voice_data)
+        elif self.analysis_mode == "voice" and (not emotions) and self.allow_fallback_in_single_mode:
+            # Fallback: if in voice-only mode but voice is missing/low, use face if minimally confident
+            if face_data and face_data.get('confidence', 0) > self.min_confidence_threshold:
+                logger.debug("[Fusion] Voice mode fallback: using face due to insufficient voice confidence")
+                _add_modality(face_data)
         elif self.analysis_mode == "fusion":
-            if face_data and face_data.get('confidence', 0) > self.face_confidence_threshold:
-                emotions.append(face_data['emotions'])
-                weights.append(face_data['confidence'])
-                confidences.append(face_data['confidence'])
-            if voice_data and voice_data.get('confidence', 0) > self.voice_confidence_threshold:
-                emotions.append(voice_data['emotions'])
-                weights.append(voice_data['confidence'])
-                confidences.append(voice_data['confidence'])
+            if face_data and face_data.get('confidence', 0) > self.min_confidence_threshold:
+                _add_modality(face_data)
+            if voice_data and voice_data.get('confidence', 0) > self.min_confidence_threshold:
+                _add_modality(voice_data)
+            # Fallback: if none passed threshold but we have modalities, take the one with higher confidence
+            if not emotions:
+                candidates = []
+                if face_data:
+                    candidates.append(face_data)
+                if voice_data:
+                    candidates.append(voice_data)
+                if candidates:
+                    best = max(candidates, key=lambda d: float(d.get('confidence', 0.0)))
+                    _add_modality(best)
 
         if not emotions:
             logger.debug("No valid emotions to fuse.")
@@ -157,19 +198,33 @@ class EmotionFusion:
 
         # Normalize weights
         weights_array = np.array(weights)
+        # Combine base weights with confidences
+        if len(emotions) == 2:
+            combined_weights = [
+                max(0.0, float(self.base_face_weight)) * max(0.0, float(weights[0])),
+                max(0.0, float(self.base_voice_weight)) * max(0.0, float(weights[1]))
+            ]
+        else:
+            # Single-modality: use the confidence directly
+            combined_weights = [max(0.0, float(weights[0]))]
+
+        weights_array = np.array(combined_weights)
         if np.sum(weights_array) > 0:
             normalized_weights = weights_array / np.sum(weights_array)
         else:
-            # Equal weights if all weights are zero
             normalized_weights = np.ones(len(weights)) / len(weights)
 
         # Weighted fusion
         fused_valence = sum(w * e['valence'] for w, e in zip(normalized_weights, emotions))
         fused_arousal = sum(w * e['arousal'] for w, e in zip(normalized_weights, emotions))
 
+        # Aggregate confidence as weighted average (bounded)
+        aggregated_conf = float(np.clip(np.sum(normalized_weights * np.array(confidences)), 0.0, 1.0)) if confidences else 0.0
+
         return {
             'valence': float(fused_valence),
-            'arousal': float(fused_arousal)
+            'arousal': float(fused_arousal),
+            'confidence': aggregated_conf
         }
 
     def _calculate_uncertainty(self, emotions: List[Dict], confidences: List[float],

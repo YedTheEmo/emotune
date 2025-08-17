@@ -184,6 +184,14 @@ class SessionManager:
             self.emotion_fusion.set_analysis_mode(mode)
             logger.info(f"Updated analysis mode: {mode}")
 
+    def update_fusion_options(self, options: Dict[str, object]):
+        """Update fusion-level options such as fallback and fusion min confidence."""
+        if self.emotion_fusion:
+            allow_fallback = options.get('allow_fallback')
+            fusion_min_conf = options.get('fusion_min_conf')
+            self.emotion_fusion.update_options(allow_fallback=allow_fallback, fusion_min_conf=fusion_min_conf)
+            logger.info(f"Updated fusion options: allow_fallback={allow_fallback}, fusion_min_conf={fusion_min_conf}")
+
     def start_emotion_monitoring(self, session_id: str):
         """Start emotion monitoring with proper initialization"""
         if self.running:
@@ -733,7 +741,7 @@ class SessionManager:
             
             # Validate values
             valence = float(np.clip(valence, -1.0, 1.0))
-            arousal = float(np.clip(arousal, 0.0, 1.0))
+            arousal = float(np.clip(arousal, -1.0, 1.0))
             confidence = float(np.clip(confidence, 0.0, 1.0))
             timestamp = float(timestamp)
             
@@ -778,6 +786,11 @@ class SessionManager:
             if fused_result:
                 # Add timestamp
                 fused_result['timestamp'] = time.time()
+                # Attach raw modalities for frontend diagnostics
+                if face_data is not None:
+                    fused_result['face'] = face_data
+                if voice_data is not None:
+                    fused_result['voice'] = voice_data
                 
                 # Ensure we have the 'mean' structure that our processing expects
                 if 'mean' not in fused_result:
@@ -785,28 +798,48 @@ class SessionManager:
                     if 'valence' in fused_result and 'arousal' in fused_result:
                         fused_result = {
                             'mean': {
-                                'valence': fused_result['valence'],
-                                'arousal': fused_result['arousal']
+                                'valence': float(np.clip(fused_result['valence'], -1.0, 1.0)),
+                                'arousal': float(np.clip(fused_result['arousal'], -1.0, 1.0))
                             },
-                            'confidence': fused_result.get('confidence', 0.5),
-                            'timestamp': fused_result['timestamp']
+                            'confidence': float(np.clip(fused_result.get('confidence', 0.5), 0.0, 1.0)),
+                            'timestamp': fused_result['timestamp'],
+                            'sources': fused_result.get('sources', {}),
+                            'face': face_data,
+                            'voice': voice_data
                         }
                     else:
                         # Create default structure
                         fused_result = {
-                            'mean': {'valence': 0.0, 'arousal': 0.5},
+                            'mean': {'valence': 0.0, 'arousal': 0.0},
                             'confidence': 0.5,
-                            'timestamp': fused_result['timestamp']
+                            'timestamp': fused_result['timestamp'],
+                            'sources': fused_result.get('sources', {}),
+                            'face': face_data,
+                            'voice': voice_data
                         }
+                else:
+                    # Ensure clipping and carry sources
+                    fused_result = {
+                        'mean': {
+                            'valence': float(np.clip(fused_result['mean'].get('valence', 0.0), -1.0, 1.0)),
+                            'arousal': float(np.clip(fused_result['mean'].get('arousal', 0.0), -1.0, 1.0))
+                        },
+                        'confidence': float(np.clip(fused_result.get('confidence', 0.5), 0.0, 1.0)),
+                        'timestamp': fused_result['timestamp'],
+                        'sources': fused_result.get('sources', {}),
+                        'face': face_data,
+                        'voice': voice_data
+                    }
                 
                 logger.debug(f"Fused emotion result: {fused_result}")
                 return fused_result
             else:
                 logger.warning("Fusion returned None, creating default structure")
                 return {
-                    'mean': {'valence': 0.0, 'arousal': 0.5},
+                    'mean': {'valence': 0.0, 'arousal': 0.0},
                     'confidence': 0.5,
-                    'timestamp': time.time()
+                    'timestamp': time.time(),
+                    'sources': {'face': False, 'voice': False}
                 }
             
         except Exception as e:
@@ -838,10 +871,16 @@ class SessionManager:
             timestamp = emotion_data.get('timestamp', time.time())
             
             # Step 2: Apply Kalman Filter
-            state, cov = self.kalman_filter.update({
-                'valence': valence, 'arousal': arousal, 'confidence': confidence,
-                'uncertainty': 1.0 - confidence
-            })
+            sources = emotion_data.get('sources', {})
+            has_observation = bool(sources.get('face') or sources.get('voice'))
+            if (not has_observation) or (confidence is not None and confidence < 0.2):
+                # Predict-only step when we don't trust the measurement
+                state, cov = self.kalman_filter.predict()
+            else:
+                state, cov = self.kalman_filter.update({
+                    'valence': valence, 'arousal': arousal, 'confidence': confidence,
+                    'uncertainty': 1.0 - confidence
+                })
             filtered_valence, filtered_arousal = state[0], state[1]
             logger.debug(f"Kalman filtered: V={filtered_valence:.3f}, A={filtered_arousal:.3f}")
 
@@ -974,19 +1013,29 @@ class SessionManager:
                 'trajectory_progress': self._get_trajectory_progress(),
                 'music_parameters': self._serialize_music_parameters(music_params),
                 'system_logs': {
-                    'face_data': {
-                        'valence': raw_emotion.get('face', {}).get('emotions', {}).get('valence') if raw_emotion else None,
-                        'arousal': raw_emotion.get('face', {}).get('emotions', {}).get('arousal') if raw_emotion else None
-                    },
-                    'voice_data': {
-                        'valence': raw_emotion.get('voice', {}).get('emotions', {}).get('valence') if raw_emotion else None,
-                        'arousal': raw_emotion.get('voice', {}).get('emotions', {}).get('arousal') if raw_emotion else None
-                    },
+                    'face_data': (
+                        {
+                            'valence': raw_emotion.get('face', {}).get('emotions', {}).get('valence'),
+                            'arousal': raw_emotion.get('face', {}).get('emotions', {}).get('arousal'),
+                            'confidence': raw_emotion.get('face', {}).get('confidence')
+                        } if raw_emotion and isinstance(raw_emotion, dict) and raw_emotion.get('face') is not None else {'valence': None, 'arousal': None, 'confidence': None}
+                    ),
+                    'voice_data': (
+                        {
+                            'valence': raw_emotion.get('voice', {}).get('emotions', {}).get('valence'),
+                            'arousal': raw_emotion.get('voice', {}).get('emotions', {}).get('arousal'),
+                            'confidence': raw_emotion.get('voice', {}).get('confidence')
+                        } if raw_emotion and isinstance(raw_emotion, dict) and raw_emotion.get('voice') is not None else {'valence': None, 'arousal': None, 'confidence': None}
+                    ),
                     'fusion': {
                         'valence': filtered_emotion['mean']['valence'] if filtered_emotion else raw_emotion.get('mean', {}).get('valence'),
                         'arousal': filtered_emotion['mean']['arousal'] if filtered_emotion else raw_emotion.get('mean', {}).get('arousal'),
                         'confidence': filtered_emotion.get('confidence', 0.5) if filtered_emotion else raw_emotion.get('confidence', 0.5)
                     },
+                    'fusion_sources': (
+                        filtered_emotion.get('sources') if filtered_emotion and isinstance(filtered_emotion, dict) and filtered_emotion.get('sources') is not None
+                        else raw_emotion.get('sources') if raw_emotion and isinstance(raw_emotion, dict) else {}
+                    ),
                     'music_engine': {
                         'status': 'active',
                         'tempo': music_params.get('tempo_bpm'),

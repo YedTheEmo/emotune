@@ -122,6 +122,23 @@ class EmoTuneGothicClient {
             console.log('Reconnected after', attemptNumber, 'attempts');
             this.showGothicNotification('Reconnected to server', 'success');
         });
+
+        // Acknowledgements
+        this.socket.on('mode_updated', (data) => {
+            if (data && data.success) {
+                this.showGothicNotification('Analysis mode updated', 'success');
+            }
+        });
+        this.socket.on('thresholds_updated', (data) => {
+            if (data && data.success) {
+                this.showGothicNotification('Confidence thresholds updated', 'success');
+            }
+        });
+        this.socket.on('fusion_options_updated', (data) => {
+            if (data && data.success) {
+                this.showGothicNotification('Fusion options updated', 'success');
+            }
+        });
     }
     
     setupEventListeners() {
@@ -171,6 +188,9 @@ class EmoTuneGothicClient {
         const voiceConfidenceSlider = document.getElementById('voiceConfidenceSlider');
         const faceConfidenceValue = document.getElementById('faceConfidenceValue');
         const voiceConfidenceValue = document.getElementById('voiceConfidenceValue');
+        const fusionMinConfSlider = document.getElementById('fusionMinConfSlider');
+        const fusionMinConfValue = document.getElementById('fusionMinConfValue');
+        const fallbackToggle = document.getElementById('fallbackToggle');
 
         faceConfidenceSlider.addEventListener('input', (e) => {
             faceConfidenceValue.textContent = parseFloat(e.target.value).toFixed(2);
@@ -180,6 +200,15 @@ class EmoTuneGothicClient {
         voiceConfidenceSlider.addEventListener('input', (e) => {
             voiceConfidenceValue.textContent = parseFloat(e.target.value).toFixed(2);
             this.updateConfidenceThresholds();
+        });
+
+        fusionMinConfSlider.addEventListener('input', (e) => {
+            fusionMinConfValue.textContent = parseFloat(e.target.value).toFixed(2);
+            this.updateFusionOptions();
+        });
+
+        fallbackToggle.addEventListener('change', () => {
+            this.updateFusionOptions();
         });
 
         // Analysis mode radio buttons
@@ -204,14 +233,19 @@ class EmoTuneGothicClient {
         this.showGothicNotification(`Confidence thresholds updated: Face=${faceThreshold.toFixed(2)}, Voice=${voiceThreshold.toFixed(2)}`, 'info');
     }
 
-    updateAnalysisMode(mode) {
-        this.socket.emit('update_analysis_mode', { mode: mode }, (response) => {
-            if (response.success) {
-                console.log('Analysis mode updated successfully');
-            } else {
-                console.error('Failed to update analysis mode');
-            }
+    updateFusionOptions() {
+        if (!this.isConnected) return;
+        const allowFallback = document.getElementById('fallbackToggle').checked;
+        const fusionMinConf = parseFloat(document.getElementById('fusionMinConfSlider').value);
+        this.socket.emit('update_fusion_options', {
+            allow_fallback: allowFallback,
+            fusion_min_conf: fusionMinConf
         });
+        this.showGothicNotification(`Fusion options: fallback=${allowFallback ? 'on' : 'off'}, minC=${fusionMinConf.toFixed(2)}`, 'info');
+    }
+
+    updateAnalysisMode(mode) {
+        this.socket.emit('update_analysis_mode', { mode: mode });
         console.log('Emitting analysis mode:', mode);
     }
     
@@ -228,31 +262,31 @@ class EmoTuneGothicClient {
     
     async setupMediaCapture() {
         try {
-            // Setup camera feed
+            // Setup camera feed (backend MJPEG)
             const cameraFeed = document.getElementById('cameraFeed');
             const cameraStatus = document.getElementById('cameraStatus');
+            if (cameraFeed) {
+                cameraFeed.addEventListener('load', () => {
+                    cameraStatus.textContent = 'Active';
+                    cameraStatus.style.color = '#d4af37';
+                });
+                cameraFeed.addEventListener('error', () => {
+                    cameraStatus.textContent = 'Error';
+                    cameraStatus.style.color = '#8b0000';
+                });
+            }
             
             // Setup audio waveform
             this.waveformCanvas = document.getElementById('audioWaveform');
             this.waveformCtx = this.waveformCanvas.getContext('2d');
             this.waveformCanvas.width = this.waveformCanvas.offsetWidth;
             this.waveformCanvas.height = this.waveformCanvas.offsetHeight;
-            
             const audioStatus = document.getElementById('audioStatus');
             
-            // Request media permissions
+            // Request audio only to avoid camera contention
             const stream = await navigator.mediaDevices.getUserMedia({
-                video: { width: 640, height: 480 },
                 audio: true
             });
-            
-            // Setup camera
-            this.cameraStream = stream.getVideoTracks()[0];
-            cameraFeed.srcObject = stream;
-            cameraStatus.textContent = 'Active';
-            cameraStatus.style.color = '#d4af37';
-            
-            // Setup audio
             this.audioStream = stream.getAudioTracks()[0];
             this.setupAudioAnalysis(stream);
             audioStatus.textContent = 'Active';
@@ -379,6 +413,42 @@ class EmoTuneGothicClient {
         }
     }
     
+    updateCaptureIndicators(systemLogs, emotionState, fullPayload) {
+        // Pull raw modality data
+        const face = systemLogs.face_data || {};
+        const voice = systemLogs.voice_data || {};
+        // Try to infer used sources from payload (if available in fused result). Fallback to confidence>0 threshold
+        let faceUsed = '-';
+        let voiceUsed = '-';
+        if (systemLogs.fusion_sources) {
+            faceUsed = systemLogs.fusion_sources.face ? 'Yes' : 'No';
+            voiceUsed = systemLogs.fusion_sources.voice ? 'Yes' : 'No';
+        } else if (fullPayload && fullPayload.fusion && fullPayload.fusion.sources) {
+            faceUsed = fullPayload.fusion.sources.face ? 'Yes' : 'No';
+            voiceUsed = fullPayload.fusion.sources.voice ? 'Yes' : 'No';
+        } else {
+            faceUsed = (typeof face.confidence === 'number' && face.confidence > 0.05) ? 'Yes' : 'No';
+            voiceUsed = (typeof voice.confidence === 'number' && voice.confidence > 0.05) ? 'Yes' : 'No';
+        }
+
+        // Update DOM
+        const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+        set('faceV', this._fmt(face.valence));
+        set('faceA', this._fmt(face.arousal));
+        set('faceC', this._fmt(face.confidence));
+        set('voiceV', this._fmt(voice.valence));
+        set('voiceA', this._fmt(voice.arousal));
+        set('voiceC', this._fmt(voice.confidence));
+        set('faceUsed', faceUsed);
+        set('voiceUsed', voiceUsed);
+    }
+
+    _fmt(val) {
+        if (val === null || val === undefined || Number.isNaN(val)) return '-';
+        const num = Number(val);
+        return Number.isFinite(num) ? num.toFixed(3) : '-';
+    }
+    
     updateConnectionStatus(connected) {
         const statusOrb = document.getElementById('statusOrb');
         const statusText = document.getElementById('statusText');
@@ -502,6 +572,7 @@ class EmoTuneGothicClient {
         // Update system logs with the received data
         if (data.system_logs) {
             this.updateSystemLogs(data.system_logs);
+            this.updateCaptureIndicators(data.system_logs, data.emotion_state, data);
         }
     }
     

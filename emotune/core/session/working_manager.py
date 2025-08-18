@@ -21,7 +21,7 @@ logger = get_logger()
 
 @dataclass
 class WorkingSessionConfig:
-    emotion_update_rate: float = 1.0
+    emotion_update_rate: float = 0.5  # Reduced from 1.0 to prevent UI freezing
     music_update_rate: float = 0.2
     trajectory_name: str = "calm_down"
     session_duration: float = 600.0

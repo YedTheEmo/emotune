@@ -12,9 +12,9 @@ class FeedbackProcessor:
         """
         Analyzes user feedback and translates it into musical adjustments and an impact statement.
         """
-        rating = feedback_data.get('rating', 3)  # Neutral default
-        comfort = feedback_data.get('comfort', 5)  # Neutral default
-        effectiveness = feedback_data.get('effectiveness', 5)  # Neutral default
+        rating = int(np.clip(feedback_data.get('rating', 3), 1, 5))
+        comfort = int(np.clip(feedback_data.get('comfort', 5), 1, 10))
+        effectiveness = int(np.clip(feedback_data.get('effectiveness', 5), 1, 10))
 
         adjustments = {}
         impact_statements = []
@@ -30,31 +30,24 @@ class FeedbackProcessor:
 
         # --- Analyze Comfort ---
         if comfort < 4:
-            adjustments['dissonance_level'] = -0.2  # Reduce dissonance
-            adjustments['warmth'] = 0.15            # Increase warmth
+            adjustments['dissonance_level'] = -0.1  # Soften
+            adjustments['warmth'] = 0.08            # Increase warmth
             impact_statements.append("You felt uncomfortable, so the music will be made less dissonant and warmer.")
         elif comfort > 7:
-            adjustments['dissonance_level'] = 0.1  # Allow slightly more dissonance
-            impact_statements.append("You felt comfortable, so the system will maintain the current harmonic structure.")
+            adjustments['brightness'] = 0.05
+            impact_statements.append("You felt comfortable, so the texture will be a bit brighter.")
 
-        # --- Analyze Overall Rating ---
-        if rating <= 2: # Negative or Very Negative
-            adjustments['tempo_bpm'] = -10         # Slow down
-            adjustments['brightness'] = -0.1       # Make it darker
-            impact_statements.append("Based on your negative rating, the tempo and brightness will be lowered.")
-        elif rating >= 4: # Positive or Very Positive
-            adjustments['tempo_bpm'] = 10          # Speed up
-            adjustments['brightness'] = 0.1        # Make it brighter
-            impact_statements.append("Based on your positive rating, the tempo and brightness will be increased.")
-
-        if not impact_statements:
-            impact_statement = "Your feedback is neutral. The system will continue with the current musical direction."
-        else:
-            impact_statement = " ".join(impact_statements)
+        # --- Overall sentiment (rating 1..5) nudges tempo/brightness ---
+        sentiment_nudge = (rating - 3) / 2.0  # -1..+1 scaled
+        adjustments['tempo_bpm'] = adjustments.get('tempo_bpm', 0.0) + 2.0 * sentiment_nudge
+        adjustments['brightness'] = adjustments.get('brightness', 0.0) + 0.05 * sentiment_nudge
 
         return {
-            "adjustments": adjustments,
-            "impact_statement": impact_statement
+            'adjustments': adjustments,
+            'impact': " ".join(impact_statements) if impact_statements else "Thanks for your feedback.",
+            'rating': rating,
+            'comfort': comfort,
+            'effectiveness': effectiveness
         }
         
     def compute_reward_signal(self, trajectory_deviation: float, 

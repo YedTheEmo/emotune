@@ -107,8 +107,15 @@ class FeedbackCollector:
     
     def get_session_feedback_summary(self) -> Dict:
         """Get summary of feedback for current session"""
+        elapsed = time.time() - self.session_start_time
         if not self.current_session_feedback:
-            return {"total_feedback": 0, "average_score": 0.0, "feedback_types": {}}
+            return {
+                "total_feedback": 0,
+                "average_score": 0.0,
+                "feedback_types": {},
+                "session_duration": elapsed,
+                "interaction_rate": (self.interaction_count / (elapsed / 60.0)) if elapsed > 0 else 0.0
+            }
         
         feedback_by_type = {}
         total_score = 0.0
@@ -127,7 +134,8 @@ class FeedbackCollector:
             "total_feedback": len(self.current_session_feedback),
             "average_score": total_score / len(self.current_session_feedback),
             "feedback_types": type_averages,
-            "session_duration": time.time() - self.session_start_time
+            "session_duration": elapsed,
+            "interaction_rate": (self.interaction_count / (elapsed / 60.0)) if elapsed > 0 else 0.0
         }
     
     def _store_feedback(self, feedback: FeedbackEvent) -> None:

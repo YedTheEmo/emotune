@@ -54,6 +54,9 @@ class EmotionCapture:
         # Audio configuration
         self._audio_device = None
         self._audio_buffer_size = int(audio_duration * sample_rate)
+        # NEW: Keep the latest audio chunk to combine with frames
+        self._latest_audio = None
+        self._audio_lock = threading.Lock()
         
         # ENHANCED CLEANUP: Shutdown event for thread coordination
         self._shutdown_event = threading.Event()
@@ -330,6 +333,9 @@ class EmotionCapture:
         audio_thread = threading.Thread(target=self._audio_capture_loop, name="AudioCapture", daemon=True)
         audio_thread.start()
         
+        consecutive_frame_failures = 0
+        reinit_threshold = 15
+        
         try:
             while self.running and not self._shutdown_event.is_set():
                 if self._force_stop_event.is_set():
@@ -343,17 +349,21 @@ class EmotionCapture:
                     frame = self._capture_frame()
                     
                     if frame is not None:
+                        consecutive_frame_failures = 0
                         # Update last frame for preview
                         try:
                             with self._last_frame_lock:
                                 self._last_frame = frame.copy()
                         except Exception:
                             pass
-                        # Put only frame data in the queue
+                        # Put combined data (frame + latest audio) in the queue
+                        with self._audio_lock:
+                            latest_audio = None if self._latest_audio is None else self._latest_audio.copy()
                         data = {
                             'timestamp': current_time,
                             'frame': frame,
-                            'audio': None  # Audio will be handled separately
+                            'audio': latest_audio,
+                            'sr': self.sample_rate
                         }
                         
                         try:
@@ -361,13 +371,25 @@ class EmotionCapture:
                             self._last_frame_time = current_time
                             self._capture_stats['frames_captured'] += 1
                         except queue.Full:
-                            # Drop oldest data if queue is full
+                            # Drop oldest data if queue is full (prefer keeping latest)
                             try:
                                 self.data_queue.get_nowait()
                                 self.data_queue.put_nowait(data)
                                 self._capture_stats['frames_dropped'] += 1
                             except queue.Empty:
                                 pass
+                    else:
+                        consecutive_frame_failures += 1
+                        if consecutive_frame_failures >= reinit_threshold:
+                            logger.warning("Repeated frame capture failures; attempting camera reinitialization")
+                            self._release_camera()
+                            # brief pause then try to reinit
+                            time.sleep(0.2)
+                            if not self._initialize_camera():
+                                logger.error("Camera reinitialization failed; will retry")
+                            else:
+                                logger.info("Camera reinitialized successfully")
+                            consecutive_frame_failures = 0
                 
                 # Brief sleep to yield to other threads
                 time.sleep(0.001)
@@ -387,18 +409,20 @@ class EmotionCapture:
                 audio_chunk = self._capture_audio_safe()
                 
                 if audio_chunk is not None:
-                    data = {
-                        'timestamp': time.time(),
-                        'frame': None,
-                        'audio': audio_chunk
-                    }
-                    
+                    # Update latest buffered audio for pairing
+                    with self._audio_lock:
+                        self._latest_audio = audio_chunk
+                    # Also enqueue an audio-only item to ensure voice analysis proceeds even if frames drop
                     try:
-                        self.data_queue.put_nowait(data)
-                        self._capture_stats['audio_chunks'] += 1
+                        self.data_queue.put_nowait({
+                            'timestamp': time.time(),
+                            'frame': None,
+                            'audio': audio_chunk,
+                            'sr': self.sample_rate
+                        })
                     except queue.Full:
-                        # Audio data is less critical, so we can drop it if the queue is full
                         pass
+                    self._capture_stats['audio_chunks'] += 1
                 
                 # Sleep for the duration of the audio chunk to avoid constant recapture
                 time.sleep(self.audio_duration)
@@ -416,17 +440,17 @@ class EmotionCapture:
         try:
             with self._camera_lock:
                 ret, frame = self._camera.read()
-            
+                
             if not ret or frame is None:
                 return None
-            
+                
             # Validate frame
             if not isinstance(frame, np.ndarray):
                 return None
-            
+                
             if frame.ndim != 3 or frame.shape[2] != 3:
                 return None
-            
+                
             # Check for black frames (relaxed) and log
             frame_mean = np.mean(frame)
             frame_max = np.max(frame)
@@ -443,7 +467,7 @@ class EmotionCapture:
             # Save debug frame occasionally
             if self._capture_stats['frames_captured'] % 30 == 0:  # Every 30 frames
                 self._save_debug_frame(frame)
-            
+                
             # Return raw BGR frame; analyzer will handle color conversion
             return frame
             
@@ -491,8 +515,7 @@ class EmotionCapture:
         return (self.running and 
                 self.capture_thread is not None and 
                 hasattr(self.capture_thread, 'is_alive') and
-                self.capture_thread.is_alive() and
-                self._camera_initialized)
+                self.capture_thread.is_alive())
 
     def get_stats(self) -> Dict:
         """Get capture statistics"""

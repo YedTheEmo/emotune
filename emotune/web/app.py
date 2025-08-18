@@ -96,10 +96,9 @@ def create_app(db):
         import time
         while True:
             try:
+                frame = None
                 if session_manager and hasattr(session_manager, 'emotion_capture') and session_manager.emotion_capture:
                     frame = session_manager.emotion_capture.get_last_frame()
-                else:
-                    frame = None
                 if frame is None:
                     time.sleep(0.05)
                     continue
@@ -238,24 +237,32 @@ def create_app(db):
         session_manager.set_socketio_sid(request.sid)
         emit('connected', {'message': 'Connected to EmoTune server'})
 
-    @socketio.on('disconnect')
-    def on_disconnect():
-        logger.info(f"[SocketIO] Client disconnected: {request.sid}")
-        # Clear the SocketIO SID when client disconnects
-        session_manager.set_socketio_sid(None)
-
     @socketio.on('start_emotion_monitoring')
-    def on_start_monitoring():
+    def on_start_monitoring(data=None):
         logger.info("[SocketIO] Emotion monitoring requested")
-        sid = session.get('session_id')
+        sid = None
+        try:
+            if isinstance(data, dict):
+                sid = data.get('session_id')
+        except Exception:
+            pass
+        if not sid:
+            sid = session.get('session_id')
         if sid:
             # Map session UUID to SocketIO sid
             session_uuid_to_sid[sid] = request.sid
             sid_to_session_uuid[request.sid] = sid
-            # Set the real SocketIO sid in SessionManager for backend emits
+            # Join the room for this session
+            try:
+                from flask_socketio import join_room
+                join_room(sid)
+            except Exception as e:
+                logger.debug(f"join_room error: {e}")
+            # Set the real SocketIO room in SessionManager for backend emits
+            session_manager.set_socketio_room(sid)
             session_manager.set_socketio_sid(request.sid)
             session_manager.start_emotion_monitoring(sid)
-            emit('monitoring_started', {'message': 'Monitoring started'})
+            emit('monitoring_started', {'status': 'active'}, to=request.sid)
         else:
             emit('error', {'message': 'No active session'})
 

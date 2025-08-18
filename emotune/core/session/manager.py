@@ -34,7 +34,7 @@ logger = get_logger()
 
 @dataclass
 class SessionConfig:
-    emotion_update_rate: float = 1.0  # Hz
+    emotion_update_rate: float = 0.5  # Hz (reduced from 1.0 to prevent UI freezing)
     music_update_rate: float = 0.2  # Hz (every 5 seconds)
     trajectory_name: str = "calm_down"
     session_duration: float = 600.0  # 10 minutes default
@@ -233,11 +233,19 @@ class SessionManager:
         try:
             session_id = str(uuid.uuid4())
             self._current_session_id = session_id  # Store session ID for database operations
+            # Also store a room name for Socket.IO broadcasts
+            self.set_socketio_room(session_id)
             logger.info(f"Starting session {session_id} with trajectory {trajectory_type}")
             
             # Reset emotion state
             self.emotion_state.reset()
             self.kalman_filter.reset()
+            
+            # Ensure Pyo engine exists (it may have been cleaned up on previous stop)
+            if self.pyo_engine is None:
+                logger.info("Reinitializing Pyo engine for new session...")
+                self.pyo_engine = create_music_engine("auto")
+                logger.info("Pyo engine reinitialized")
             
             # Start trajectory
             from emotune.core.trajectory.library import TrajectoryType
@@ -270,6 +278,13 @@ class SessionManager:
             # Phase 1: Signal all systems to stop
             self.running = False
             self.shutdown_event.set()
+            
+            # Stop trajectory planner to clear target/paths
+            try:
+                if hasattr(self, 'trajectory_planner') and self.trajectory_planner:
+                    self.trajectory_planner.stop_trajectory()
+            except Exception as e:
+                logger.debug(f"Trajectory stop error: {e}")
             
             # Phase 2: Stop emotion capture with enhanced cleanup
             if hasattr(self, 'emotion_capture') and self.emotion_capture:
@@ -405,7 +420,7 @@ class SessionManager:
                 logger.error(f"Error stopping {engine_name} engine: {e}")
                 # Continue with other engines even if one fails
         
-        # Reset engine references
+        # Reset engine references (allow re-init on next session)
         self.pyo_engine = None
         self.tidal_engine = None
         self.sonicpi_engine = None
@@ -566,6 +581,10 @@ class SessionManager:
         """Set SocketIO session ID for frontend communication"""
         self._current_socketio_sid = socketio_sid
 
+    def set_socketio_room(self, room_name: str):
+        """Set Socket.IO room (typically the session_id) for emissions"""
+        self._socketio_room = room_name
+
     def _emotion_capture_loop(self):
         """Improved emotion capture loop with better error handling and performance"""
         logger.info("Starting emotion capture loop")
@@ -573,8 +592,25 @@ class SessionManager:
         consecutive_empty_count = 0
         max_consecutive_empty = 10
         
+        # NEW: small buffers to align frame and audio by timestamp
+        frame_buffer = []  # list of (ts, frame)
+        audio_buffer = []  # list of (ts, audio, sr)
+        buffer_horizon = 2.0  # seconds to keep
+        pair_window = 1.0     # acceptable frame-audio delta in seconds
+        
+        # FIX: Add rate limiting to respect configured emotion_update_rate
+        last_emotion_update_time = 0.0
+        emotion_update_interval = 1.0 / self.config.emotion_update_rate  # Convert Hz to seconds
+        
         while not self.shutdown_event.is_set() and self.running:
             try:
+                current_time = time.time()
+                
+                # FIX: Rate limit emotion updates to configured frequency
+                if current_time - last_emotion_update_time < emotion_update_interval:
+                    time.sleep(0.01)  # Brief pause to avoid tight loop
+                    continue
+                
                 # Get data from emotion capture
                 data = self.emotion_capture.get_data()
                 
@@ -598,8 +634,49 @@ class SessionManager:
                 # Reset empty counter on successful data
                 consecutive_empty_count = 0
                 
-                # Process the data
-                self._process_captured_data(data)
+                # Demux incoming item
+                ts = data.get('timestamp', time.time())
+                if data.get('frame') is not None:
+                    frame_buffer.append((ts, data['frame']))
+                if data.get('audio') is not None:
+                    audio_buffer.append((ts, data['audio'], data.get('sr', 16000)))
+                
+                # Drop old items
+                cutoff = time.time() - buffer_horizon
+                frame_buffer = [(t, f) for (t, f) in frame_buffer if t >= cutoff]
+                audio_buffer = [(t, a, s) for (t, a, s) in audio_buffer if t >= cutoff]
+                
+                # Try to form a pair (closest in time within window)
+                analysis_data = {}
+                if frame_buffer:
+                    # take latest frame
+                    ft, ff = frame_buffer[-1]
+                    analysis_data['frame'] = ff
+                    # find closest audio
+                    closest = None
+                    best_dt = None
+                    for at, aa, sr in audio_buffer:
+                        dt = abs(at - ft)
+                        if best_dt is None or dt < best_dt:
+                            best_dt = dt
+                            closest = (at, aa, sr)
+                    if closest and best_dt is not None and best_dt <= pair_window:
+                        analysis_data['audio'] = closest[1]
+                        analysis_data['sr'] = closest[2]
+                elif audio_buffer:
+                    # allow voice-only analysis when no frames
+                    at, aa, sr = audio_buffer[-1]
+                    analysis_data['audio'] = aa
+                    analysis_data['sr'] = sr
+                
+                # Process the data if we have something
+                if analysis_data:
+                    self._process_captured_data(analysis_data)
+                    # FIX: Update last emotion update time to enforce rate limiting
+                    last_emotion_update_time = current_time
+                else:
+                    # small pause to avoid tight loop
+                    time.sleep(0.01)
                 
             except Exception as e:
                 logger.error(f"Error in emotion capture loop: {e}")
@@ -705,10 +782,10 @@ class SessionManager:
     def _emit_missing_data_warning(self, current_time: float):
         """Emit warning about missing data to frontend"""
         if self.app is not None and self.socketio is not None:
-            sid = getattr(self, '_current_socketio_sid', None)
-            if sid:
+            room = getattr(self, '_socketio_room', None)
+            if room:
                 warning_msg = f'No emotion data received for {int(current_time - self._last_valid_emotion_time)} seconds.'
-                self.socketio.emit('emotion_update', {'warning': warning_msg}, room=sid)
+                self.socketio.emit('emotion_update', {'warning': warning_msg}, room=room)
                 self._missing_data_warning_sent = True
 
     def _save_emotion_to_database(self, emotion_data: Dict):
@@ -829,7 +906,7 @@ class SessionManager:
                         'sources': fused_result.get('sources', {}),
                         'face': face_data,
                         'voice': voice_data
-                    }
+                        }
                 
                 logger.debug(f"Fused emotion result: {fused_result}")
                 return fused_result
@@ -999,12 +1076,10 @@ class SessionManager:
             if self.app is None or self.socketio is None:
                 logger.warning("Cannot emit emotion update: app or socketio not available")
                 return
-                
-            sid = getattr(self, '_current_socketio_sid', None)
-            logger.debug(f"SocketIO SID: {sid}")
-            
-            if not sid:
-                logger.warning("Cannot emit emotion update: no SocketIO SID available")
+            # Use room-based broadcasting keyed by session_id to handle multi-tab
+            room = getattr(self, '_socketio_room', None)
+            if not room:
+                logger.warning("Cannot emit emotion update: no Socket.IO room set")
                 return
             
             # Prepare payload with proper serialization and safe data access
@@ -1050,7 +1125,7 @@ class SessionManager:
             
             # Emit to frontend
             with self.app.app_context():
-                self.socketio.emit('emotion_update', payload, room=sid)
+                self.socketio.emit('emotion_update', payload, room=room)
             
             logger.info(f"Successfully emitted emotion update to frontend")
             
@@ -1199,8 +1274,19 @@ class SessionManager:
 
         current_target = self.trajectory_planner.get_current_target()
 
+        # Decimate/bound actual path to avoid large payloads
+        max_points = 360  # ~6 minutes at 1 Hz; decimate beyond this
+        actual_path_full = [{'valence': dp['mean']['valence'], 'arousal': dp['mean']['arousal']} for dp in emotion_trajectory]
+        if len(actual_path_full) > max_points:
+            step = max(1, len(actual_path_full) // max_points)
+            actual_path = [actual_path_full[i] for i in range(0, len(actual_path_full), step)]
+            if actual_path[-1] is not actual_path_full[-1]:
+                actual_path.append(actual_path_full[-1])
+        else:
+            actual_path = actual_path_full
+
         return {
-            'actual_path': [{'valence': dp['mean']['valence'], 'arousal': dp['mean']['arousal']} for dp in emotion_trajectory],
+            'actual_path': actual_path,
             'target_path': target_path,
             'current_target': {'valence': current_target[0], 'arousal': current_target[1]} if current_target else None,
             'deviation': adherence_info.get('deviation', 1.0),
@@ -1396,18 +1482,22 @@ class SessionManager:
                 # Get adjustments and impact statement from the processor
                 processed_result = self.feedback_processor.process_feedback(session_id, feedback)
                 adjustments = processed_result.get('adjustments')
-                impact_statement = processed_result.get('impact_statement')
+                impact_message = processed_result.get('impact')
 
                 # Apply adjustments to the RL agent
                 if self.rl_agent and adjustments:
                     self.rl_agent.update_parameters(adjustments)
                     logger.info(f"Applied feedback adjustments to RL agent: {adjustments}")
 
-                # Emit the impact statement to the frontend
-                if self.socketio and impact_statement:
-                    sid = getattr(self, '_current_socketio_sid', None)
-                    if sid:
-                        self.socketio.emit('feedback_impact', {'message': impact_statement}, room=sid)
+                # Emit the impact statement to the frontend (to the session room)
+                if self.socketio and impact_message:
+                    room = getattr(self, '_socketio_room', None) or session_id
+                    self.socketio.emit('feedback_impact', {'message': impact_message}, room=room)
+
+                # Guard against UI stalls: prompt client to ensure monitoring is active
+                if self.socketio:
+                    room = getattr(self, '_socketio_room', None) or session_id
+                    self.socketio.emit('monitoring_started', {'status': 'active'}, room=room)
 
         except Exception as e:
             logger.error(f"Error processing feedback: {e}")

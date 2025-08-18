@@ -135,10 +135,8 @@ class EmoTuneLogger:
         self.feedback_log_file = self.log_dir / 'feedback.jsonl'
         self.performance_log_file = self.log_dir / 'performance.jsonl'
 
-        # Ensure files exist
-        for log_file in [self.emotion_log_file, self.music_log_file,
-                        self.feedback_log_file, self.performance_log_file]:
-            log_file.touch(exist_ok=True)
+        # Removed eager file creation to avoid empty files
+        # Files will be created lazily on first write
 
     def set_session_id(self, session_id: str):
         """Set session ID for current thread"""
@@ -255,6 +253,8 @@ class EmoTuneLogger:
     def _write_structured_log(self, file_path: Path, entry):
         """Write structured log entry to JSONL file"""
         try:
+            # Ensure parent directory exists and create file lazily
+            file_path.parent.mkdir(exist_ok=True, parents=True)
             with open(file_path, 'a') as f:
                 json.dump(asdict(entry), f, default=str)
                 f.write('\n')

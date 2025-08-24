@@ -59,7 +59,21 @@ class FeedbackProcessor:
         trajectory_reward = 1.0 - trajectory_deviation
         
         # Emotion stability reward (lower variance is good)
-        stability_reward = 1.0 - emotion_stability
+        # Normalize covariance trace (emotion_stability) into [0,1] range using a capped max.
+        # A reasonable cap prevents extreme values from collapsing the reward.
+        STABILITY_CAP = 1.0  # fallback default; will be effectively 1.0 if caller already supplies [0,1]
+        try:
+            # If passed a large numeric, cap and normalize; if already [0,1], this is a no-op
+            norm = float(emotion_stability)
+            if not np.isfinite(norm):
+                norm = STABILITY_CAP
+            # If caller passes covariance trace, estimate a scale (heuristic) to keep in [0,1]
+            # Use a soft cap by dividing by a constant and clipping.
+            # Choose 1.0 as default so existing callers with normalized values are unchanged.
+            uncertainty_norm = np.clip(norm / max(STABILITY_CAP, 1e-6), 0.0, 1.0)
+        except Exception:
+            uncertainty_norm = 1.0
+        stability_reward = 1.0 - uncertainty_norm
         
         # User feedback reward, weighted by confidence
         user_reward = feedback_score * feedback_confidence

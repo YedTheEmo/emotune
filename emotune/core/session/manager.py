@@ -100,6 +100,9 @@ class SessionManager:
             'last_processing_time': 0
         }
 
+        # RL debug influence scale (1.0 = normal). Can be adjusted via socket event.
+        self.rl_debug_scale: float = 1.0
+
     def _init_subsystems(self):
         """Initialize all EmoTune subsystems"""
         # Core components
@@ -189,8 +192,10 @@ class SessionManager:
         if self.emotion_fusion:
             allow_fallback = options.get('allow_fallback')
             fusion_min_conf = options.get('fusion_min_conf')
-            self.emotion_fusion.update_options(allow_fallback=allow_fallback, fusion_min_conf=fusion_min_conf)
-            logger.info(f"Updated fusion options: allow_fallback={allow_fallback}, fusion_min_conf={fusion_min_conf}")
+            face_weight = options.get('face_weight')
+            voice_weight = options.get('voice_weight')
+            self.emotion_fusion.update_options(allow_fallback=allow_fallback, fusion_min_conf=fusion_min_conf, face_weight=face_weight, voice_weight=voice_weight)
+            logger.info(f"Updated fusion options: allow_fallback={allow_fallback}, fusion_min_conf={fusion_min_conf}, face_weight={face_weight}, voice_weight={voice_weight}")
 
     def start_emotion_monitoring(self, session_id: str):
         """Start emotion monitoring with proper initialization"""
@@ -200,7 +205,11 @@ class SessionManager:
             
         try:
             self.running = True
-            self.session_start_time = time.time()
+            # FIX: Remove session_start_time setting here - it's now set in start_session()
+            # self.session_start_time = time.time()  # REMOVED
+            
+            # Ensure audio resources are properly reinitialized
+            self._ensure_audio_reinitialization()
             
             # Start emotion capture
             self.emotion_capture.start_capture()
@@ -228,6 +237,53 @@ class SessionManager:
             self.running = False
             raise
 
+    def _ensure_audio_reinitialization(self):
+        """Ensure audio resources are properly reinitialized for new sessions"""
+        try:
+            logger.info("Ensuring audio resources are properly reinitialized...")
+            
+            # Force cleanup any existing audio resources
+            if hasattr(self, 'emotion_capture') and self.emotion_capture:
+                try:
+                    self.emotion_capture._force_cleanup_audio()
+                except Exception as e:
+                    logger.debug(f"Audio cleanup error during reinitialization: {e}")
+            
+            # Brief pause to allow resources to be released
+            time.sleep(0.1)
+            
+            logger.info("Audio reinitialization check completed")
+            
+        except Exception as e:
+            logger.error(f"Error during audio reinitialization: {e}")
+
+    def check_audio_status(self) -> Dict:
+        """Check and report audio capture status"""
+        try:
+            if not hasattr(self, 'emotion_capture') or not self.emotion_capture:
+                return {'status': 'no_capture', 'message': 'Emotion capture not available'}
+            
+            # Check if audio is working
+            audio_working = self.emotion_capture.is_audio_working()
+            
+            # Get capture stats
+            stats = self.emotion_capture.get_stats()
+            
+            status_info = {
+                'status': 'working' if audio_working else 'not_working',
+                'audio_chunks': stats.get('audio_chunks', 0),
+                'audio_errors': stats.get('errors', 0),
+                'frames_captured': stats.get('frames_captured', 0),
+                'frames_dropped': stats.get('frames_dropped', 0)
+            }
+            
+            logger.info(f"Audio status check: {status_info}")
+            return status_info
+            
+        except Exception as e:
+            logger.error(f"Error checking audio status: {e}")
+            return {'status': 'error', 'message': str(e)}
+
     def start_session(self, trajectory_type='calm_down', duration=300) -> str:
         """Start a new session with improved error handling"""
         try:
@@ -237,9 +293,19 @@ class SessionManager:
             self.set_socketio_room(session_id)
             logger.info(f"Starting session {session_id} with trajectory {trajectory_type}")
             
+            # FIX: Set session start time immediately when session starts, not when monitoring starts
+            self.session_start_time = time.time()
+            logger.info(f"Session start time set to: {self.session_start_time}")
+            
             # Reset emotion state
             self.emotion_state.reset()
             self.kalman_filter.reset()
+            # Reset feedback session timing so session_duration starts at 0
+            try:
+                if hasattr(self, 'feedback_collector') and self.feedback_collector:
+                    self.feedback_collector.reset_session()
+            except Exception as e:
+                logger.debug(f"Feedback reset error: {e}")
             
             # Ensure Pyo engine exists (it may have been cleaned up on previous stop)
             if self.pyo_engine is None:
@@ -492,6 +558,9 @@ class SessionManager:
         # Reset session identifiers
         self._current_session_id = None
         self.socketio_sid = None
+        
+        # FIX: Reset session start time to prevent duration calculation errors
+        self.session_start_time = 0.0
         
         # Reset statistics
         if hasattr(self, '_session_stats'):
@@ -1004,9 +1073,26 @@ class SessionManager:
                     )
 
                     # 2. Select action based on current state and update music parameters
+                    # Use mapping output as baseline, then apply RL deltas
+                    try:
+                        self.rl_agent.current_params = self._latest_music_params.copy()
+                    except Exception:
+                        self.rl_agent.current_params = music_params.copy()
                     action_adjustments = self.rl_agent.select_action(current_rl_state)
+                    # Apply debug scaling to make RL effect audible when desired
+                    try:
+                        if isinstance(action_adjustments, dict):
+                            scale = float(getattr(self, 'rl_debug_scale', 1.0) or 1.0)
+                            action_adjustments = {k: (float(v) * scale if hasattr(v, '__float__') else v) for k, v in action_adjustments.items()}
+                    except Exception:
+                        pass
                     music_params = self.rl_agent.update_parameters(action_adjustments)
                     self._latest_music_params = music_params.copy() # Make sure to update the latest params
+                    # Immediately update engine with RL-adjusted parameters for audible effect
+                    try:
+                        engine.update_parameters(music_params)
+                    except Exception:
+                        pass
 
                     # 3. If we have a previous state and action, compute reward and store experience
                     if self.last_rl_state is not None and self.last_rl_action is not None:
@@ -1082,11 +1168,67 @@ class SessionManager:
                 logger.warning("Cannot emit emotion update: no Socket.IO room set")
                 return
             
+            # Server-side emotion statistics and stability for integrity
+            stats_60s = self.emotion_state.get_emotion_statistics(time_window=60.0)
+            stability_60s = self.emotion_state.get_stability_metric(time_window=60.0)
+            
+            # Build JSON-safe RL agent payload
+            rl_agent_payload = {}
+            try:
+                if self.config.enable_rl and hasattr(self, 'rl_agent') and self.rl_agent:
+                    status = self.rl_agent.get_status() or {}
+                    # Cast to built-in Python types
+                    rl_status = {
+                        'buffer_size': int(status.get('buffer_size', 0) or 0),
+                        'learning_rate': float(status.get('learning_rate', 0.0) or 0.0),
+                        'reward_signal': float(status.get('reward_signal', 0.0) or 0.0),
+                        'policy_confidence': float(status.get('policy_confidence', 0.0) or 0.0),
+                    }
+                    last_action = self.last_rl_action if isinstance(self.last_rl_action, dict) else {}
+                    action_clean = {k: (float(v) if hasattr(v, '__float__') else v) for k, v in last_action.items()}
+                    params_clean = {}
+                    if hasattr(self, '_latest_music_params') and isinstance(self._latest_music_params, dict):
+                        names = getattr(self.rl_agent, 'param_names', []) or []
+                        for k in names:
+                            v = self._latest_music_params.get(k)
+                            params_clean[k] = float(v) if hasattr(v, '__float__') else v
+                    # Effects: human-readable mapping
+                    effects = {
+                        'tempo_bpm': 'Higher tempo increases arousal/energy.',
+                        'brightness': 'Brighter timbre increases perceived energy.',
+                        'rhythm_complexity': 'More complexity increases cognitive load and activation.',
+                        'repetition_factor': 'Higher repetition increases predictability and grounding.',
+                        'dissonance_level': 'More dissonance increases tension/negative valence.',
+                        'overall_volume': 'Louder volume increases arousal; safety capped.',
+                    }
+                    # Determine RL agent status based on buffer and training state
+                    buffer_size = rl_status.get('buffer_size', 0)
+                    if buffer_size >= 64:
+                        rl_status_text = 'Training'
+                    elif buffer_size > 0:
+                        rl_status_text = 'Active'
+                    else:
+                        rl_status_text = 'Inactive'
+                    
+                    rl_agent_payload = {**rl_status, 'status': rl_status_text, 'action': action_clean, 'params': params_clean, 'effects': effects}
+            except Exception:
+                rl_agent_payload = {}
+            
             # Prepare payload with proper serialization and safe data access
             payload = {
                 'emotion_state': self._serialize_emotion_state(filtered_emotion or raw_emotion),
                 'trajectory_progress': self._get_trajectory_progress(),
                 'music_parameters': self._serialize_music_parameters(music_params),
+                'emotion_metrics': {
+                    'window_seconds': 60.0,
+                    'mean_valence': stats_60s.get('mean_valence', 0.0),
+                    'mean_arousal': stats_60s.get('mean_arousal', 0.0),
+                    'std_valence': stats_60s.get('std_valence', 0.0),
+                    'std_arousal': stats_60s.get('std_arousal', 0.0),
+                    'stability': float(stability_60s) if hasattr(stability_60s, '__float__') else 0.0,
+                    'trajectory_length': stats_60s.get('trajectory_length', 0),
+                    'time_span': stats_60s.get('time_span', 0.0)
+                },
                 'system_logs': {
                     'face_data': (
                         {
@@ -1117,7 +1259,7 @@ class SessionManager:
                         'volume': music_params.get('overall_volume')
                     },
                     'feedback': self.feedback_collector.get_session_feedback_summary() if self.config.enable_feedback else {},
-                    'rl_agent': self.rl_agent.get_status() if self.config.enable_rl else {}
+                    'rl_agent': rl_agent_payload
                 }
             }
             
@@ -1486,8 +1628,14 @@ class SessionManager:
 
                 # Apply adjustments to the RL agent
                 if self.rl_agent and adjustments:
-                    self.rl_agent.update_parameters(adjustments)
+                    updated_params = self.rl_agent.update_parameters(adjustments)
                     logger.info(f"Applied feedback adjustments to RL agent: {adjustments}")
+                    # Immediately reflect changes in the engine for audible feedback
+                    try:
+                        eng = self._select_music_engine()
+                        eng.update_parameters(updated_params)
+                    except Exception as _e:
+                        logger.debug(f"Engine update after feedback adjustments skipped: {_e}")
 
                 # Emit the impact statement to the frontend (to the session room)
                 if self.socketio and impact_message:
@@ -1498,6 +1646,22 @@ class SessionManager:
                 if self.socketio:
                     room = getattr(self, '_socketio_room', None) or session_id
                     self.socketio.emit('monitoring_started', {'status': 'active'}, room=room)
+
+                # Persist feedback if DB is available
+                try:
+                    if self.db:
+                        self.db.save_feedback(session_id=session_id,
+                                             timestamp=time.time(),
+                                             feedback_type='explicit',
+                                             rating=feedback.get('rating'),
+                                             category=None,
+                                             context={
+                                                 'comfort': feedback.get('comfort'),
+                                                 'effectiveness': feedback.get('effectiveness'),
+                                                 'comments': feedback.get('comments')
+                                             })
+                except Exception as _e:
+                    logger.debug(f"Feedback persistence skipped: {_e}")
 
         except Exception as e:
             logger.error(f"Error processing feedback: {e}")

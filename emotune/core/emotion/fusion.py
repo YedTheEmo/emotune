@@ -28,7 +28,7 @@ class EmotionFusion:
         self.voice_confidence_threshold = 0.5
         self.analysis_mode = "fusion"  # fusion, face, or voice
 
-    def update_options(self, allow_fallback: Optional[bool] = None, fusion_min_conf: Optional[float] = None):
+    def update_options(self, allow_fallback: Optional[bool] = None, fusion_min_conf: Optional[float] = None, face_weight: Optional[float] = None, voice_weight: Optional[float] = None):
         """Update fusion-level options such as fallback behavior and fusion min confidence."""
         if allow_fallback is not None:
             self.allow_fallback_in_single_mode = bool(allow_fallback)
@@ -40,6 +40,20 @@ class EmotionFusion:
                 logger.info(f"Updated fusion option: min_confidence_threshold={self.min_confidence_threshold}")
             except (ValueError, TypeError):
                 logger.warning(f"Invalid fusion_min_conf value: {fusion_min_conf}")
+        if face_weight is not None:
+            try:
+                val = float(face_weight)
+                self.base_face_weight = float(np.clip(val, 0.0, 1.0))
+                logger.info(f"Updated fusion option: base_face_weight={self.base_face_weight}")
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid face_weight value: {face_weight}")
+        if voice_weight is not None:
+            try:
+                val = float(voice_weight)
+                self.base_voice_weight = float(np.clip(val, 0.0, 1.0))
+                logger.info(f"Updated fusion option: base_voice_weight={self.base_voice_weight}")
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid voice_weight value: {voice_weight}")
 
     def set_analysis_mode(self, mode: str):
         """Set the analysis mode."""

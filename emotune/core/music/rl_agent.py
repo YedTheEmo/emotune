@@ -175,7 +175,13 @@ class Critic(nn.Module):
 class RLAgent:
     def __init__(self, param_space: MusicParameterSpace):
         self.param_space = param_space
-        self.param_names = list(param_space.parameters.keys())
+        # Restrict control to a curated, high-impact, clinically safe subset
+        preferred = [
+            'tempo_bpm', 'brightness', 'rhythm_complexity',
+            'repetition_factor', 'dissonance_level', 'overall_volume'
+        ]
+        available = list(param_space.parameters.keys())
+        self.param_names = [p for p in preferred if p in available]
         self.action_dim = len(self.param_names)
         
         # State: [emotion_mean (2), emotion_cov (3), dtw_error (1), trajectory_progress (1)]
@@ -249,7 +255,7 @@ class RLAgent:
             'policy_confidence': torch.exp(self.sac.log_alpha).item(),
         }
     
-    def train(self, batch_size: int = 256):
+    def train(self, batch_size: int = 64):
         """Train the RL agent if enough data is available"""
         if len(self.replay_buffer) < batch_size:
             return

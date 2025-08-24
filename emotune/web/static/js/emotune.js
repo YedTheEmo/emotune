@@ -34,16 +34,109 @@ class EmoTuneGothicClient {
             max_points: 1000  // Limit to prevent memory bloat
         };
         
+        // NEW: Initialize time-series storage and canvas refs
+        this.timeseriesCanvas = null;
+        this.timeseriesCtx = null;
+        this._tsHistory = [];
+        this._tsMaxPoints = 1000;
+        this._tsWindowSeconds = 120;
+        this._lastTsDrawAt = 0;
+        this._tsUpdateIntervalMs = 100; // 10 FPS max
+        this._pendingTs = false;
+        
+        // NEW: cache last server session duration to sync progress bar
+        this._serverSessionDurationSec = 0;
+        // NEW: local progress update timers and drift correction
+        this._progressTickerId = null;
+        this._progressSyncId = null;
+        this._progressDriftOffsetSec = 0;
+        
         this.init();
+        
+        // FIX: Start periodic progress updates to prevent flickering
+        this.startProgressUpdates();
+    }
+    
+    startProgressUpdates() {
+        // Clear existing timers to avoid duplicates
+        if (this._progressTickerId) { clearInterval(this._progressTickerId); this._progressTickerId = null; }
+        if (this._progressSyncId) { clearInterval(this._progressSyncId); this._progressSyncId = null; }
+        
+        // Smooth local progress at 10Hz
+        this._progressTickerId = setInterval(() => {
+            if (this.currentSession && (this.currentSession.server_start_time || this.currentSession.startTime)) {
+                this.updateSessionProgress();
+            }
+        }, 100);
+        
+        // Periodic server sync to correct drift
+        this._progressSyncId = setInterval(() => {
+            this.syncSessionProgressFromServer().catch(() => {});
+        }, 10000);
+        
+        // FIX: Add manual test function for debugging progress bar
+        window.testProgressBar = () => {
+            console.log('Testing progress bar...');
+            const sessionInfo = document.getElementById('sessionInfo');
+            const progressFill = document.getElementById('sessionProgress');
+            const progressText = document.getElementById('progressText');
+            
+            console.log('sessionInfo:', sessionInfo);
+            console.log('progressFill:', progressFill);
+            console.log('progressText:', progressText);
+            
+            if (sessionInfo) {
+                sessionInfo.style.display = 'block';
+                console.log('Session info shown');
+            }
+            
+            if (progressFill && progressText) {
+                progressFill.style.width = '50%';
+                progressText.textContent = '50%';
+                console.log('Progress bar set to 50%');
+            }
+        };
+        
+        console.log('Progress updates started. Use window.testProgressBar() to test the progress bar manually.');
+    }
+    
+    initializeProgressBar() {
+        // Check if progress bar elements exist and are properly initialized
+        const sessionInfo = document.getElementById('sessionInfo');
+        const progressFill = document.getElementById('sessionProgress');
+        const progressText = document.getElementById('progressText');
+        
+        console.log('Progress bar initialization:');
+        console.log('- sessionInfo:', sessionInfo ? 'Found' : 'Missing');
+        console.log('- progressFill:', progressFill ? 'Found' : 'Missing');
+        console.log('- progressText:', progressText ? 'Found' : 'Missing');
+        
+        if (sessionInfo && progressFill && progressText) {
+            console.log('✅ Progress bar elements properly initialized');
+            // Set initial state
+            sessionInfo.style.display = 'none';
+            progressFill.style.width = '0%';
+            progressText.textContent = '0%';
+        } else {
+            console.warn('⚠️ Some progress bar elements are missing');
+        }
     }
     
     init() {
         this.setupSocketConnection();
         this.setupEventListeners();
         this.setupCanvas();
+        // NEW: setup time-series canvas
+        this.setupTimeSeriesCanvas();
         this.setupMediaCapture();
         this.setupRLFeedback();
         this.updateUI();
+        
+        // FIX: Start periodic progress updates to prevent flickering
+        this.startProgressUpdates();
+        
+        // FIX: Initialize progress bar elements
+        this.initializeProgressBar();
     }
     
     setupSocketConnection() {
@@ -73,7 +166,13 @@ class EmoTuneGothicClient {
             if (data && data.status === 'active') {
                 this.emotionMonitoring = true;
                 this.updateMediaStatus('active');
-                this.showGothicNotification('Media monitoring is active.', 'success');
+                // Suppress monitoring toast if it fires right after a feedback toast
+                const now = Date.now();
+                const suppressWindowMs = 1500;
+                const lastFb = this._lastFeedbackToastAt || 0;
+                if (now - lastFb > suppressWindowMs) {
+                    this.showGothicNotification('Media monitoring is active.', 'success');
+                }
             }
         });
         
@@ -109,8 +208,10 @@ class EmoTuneGothicClient {
             } else {
                 // FIX: Clean up performance variables when session ends
                 this._cleanupPerformanceVariables();
+                // Preserve currentSession until backend fully stops; UI will hide the bar
                 this.currentSession = null;
                 this.updateSessionUI(false);
+                // Keep timers alive for next session
             }
         });
 
@@ -244,12 +345,15 @@ class EmoTuneGothicClient {
             this.updateFusionOptions();
         });
 
-        // Analysis mode radio buttons
-        const analysisModeRadios = document.querySelectorAll('input[name="analysisMode"]');
-        analysisModeRadios.forEach(radio => {
-            radio.addEventListener('change', (e) => {
-                this.updateAnalysisMode(e.target.value);
-            });
+        // Ensure AudioContext resumes when tab becomes visible (fix blank waveform after pause)
+        document.addEventListener('visibilitychange', async () => {
+            try {
+                if (document.visibilityState === 'visible' && this.audioContext && this.audioContext.state === 'suspended') {
+                    await this.audioContext.resume();
+                }
+            } catch (e) {
+                console.warn('AudioContext resume failed:', e);
+            }
         });
     }
 
@@ -284,13 +388,114 @@ class EmoTuneGothicClient {
     
     setupCanvas() {
         this.trajectoryCanvas = document.getElementById('trajectoryCanvas');
-        this.trajectoryCtx = this.trajectoryCanvas.getContext('2d');
+        if (!this.trajectoryCanvas) {
+            console.error('Trajectory canvas element not found');
+            return;
+        }
         
-        // Set canvas size
-        this.trajectoryCanvas.width = this.trajectoryCanvas.offsetWidth;
-        this.trajectoryCanvas.height = this.trajectoryCanvas.offsetHeight;
+        this.trajectoryCtx = this.trajectoryCanvas.getContext('2d');
+        if (!this.trajectoryCtx) {
+            console.error('Could not get canvas 2D context');
+            return;
+        }
+        
+        console.log('Canvas setup successful, size:', this.trajectoryCanvas.offsetWidth, 'x', this.trajectoryCanvas.offsetHeight);
+        
+        // FIXED: Set canvas size with proper initialization
+        this._resizeCanvas();
+        
+        // FIXED: Add resize listener for responsive canvas
+        window.addEventListener('resize', () => {
+            this._resizeCanvas();
+            this.drawTrajectoryGrid();
+            // Redraw time series on resize as well
+            this._resizeTimeSeriesCanvas();
+            this.drawTimeSeriesAxes();
+            this.updateTimeSeriesVisualization(true);
+        });
         
         this.drawTrajectoryGrid();
+    }
+    
+    _resizeCanvas() {
+        // FIXED: Proper canvas sizing with bounds checking
+        if (this.trajectoryCanvas) {
+            const rect = this.trajectoryCanvas.getBoundingClientRect();
+            this.trajectoryCanvas.width = rect.width;
+            // NEW: enforce square aspect for circumplex plot
+            this.trajectoryCanvas.height = rect.width;
+        }
+    }
+    
+    _validateTrajectoryProgress(trajectoryProgress) {
+        // FIXED: Comprehensive validation of trajectory progress data
+        if (!trajectoryProgress || typeof trajectoryProgress !== 'object') {
+            return false;
+        }
+        
+        // Validate target_path if present
+        if (trajectoryProgress.target_path) {
+            if (!Array.isArray(trajectoryProgress.target_path)) {
+                return false;
+            }
+            for (const point of trajectoryProgress.target_path) {
+                if (!this._validateTrajectoryPoint(point)) {
+                    return false;
+                }
+            }
+        }
+        
+        // Validate actual_path if present
+        if (trajectoryProgress.actual_path) {
+            if (!Array.isArray(trajectoryProgress.actual_path)) {
+                return false;
+            }
+            for (const point of trajectoryProgress.actual_path) {
+                if (!this._validateTrajectoryPoint(point)) {
+                    return false;
+                }
+            }
+        }
+        
+        // Validate current_position if present
+        if (trajectoryProgress.current_position) {
+            if (!this._validateTrajectoryPoint(trajectoryProgress.current_position)) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    _validateTrajectoryPoint(point) {
+        // FIXED: Validate individual trajectory point
+        if (!point || typeof point !== 'object') {
+            return false;
+        }
+        
+        return (
+            typeof point.valence === 'number' && 
+            typeof point.arousal === 'number' &&
+            !isNaN(point.valence) && 
+            !isNaN(point.arousal) &&
+            isFinite(point.valence) && 
+            isFinite(point.arousal) &&
+            point.valence >= -1.0 && 
+            point.valence <= 1.0 &&
+            // UPDATED: arousal now symmetric in [-1,1]
+            point.arousal >= -1.0 && 
+            point.arousal <= 1.0
+        );
+    }
+    
+    // Normalize arousal to [-1, 1] by clamping only (server already sends [-1,1])
+    _normalizeArousal(value) {
+        if (typeof value !== 'number' || Number.isNaN(value) || !Number.isFinite(value)) {
+            return 0;
+        }
+        if (value > 1) return 1;
+        if (value < -1) return -1;
+        return value;
     }
     
     async setupMediaCapture() {
@@ -307,6 +512,30 @@ class EmoTuneGothicClient {
                     cameraStatus.textContent = 'Error';
                     cameraStatus.style.color = '#8b0000';
                 });
+            }
+            
+            // Teardown any previous audio resources before re-init
+            if (this.animationFrame) {
+                cancelAnimationFrame(this.animationFrame);
+                this.animationFrame = null;
+            }
+            if (this.audioAnalyser) {
+                this.audioAnalyser.disconnect?.();
+                this.audioAnalyser = null;
+            }
+            if (this.audioContext) {
+                try {
+                    // Prefer closing to free device handles; fall back to resume if needed
+                    await this.audioContext.close();
+                } catch (_) {
+                    try { await this.audioContext.resume(); } catch (_) {}
+                }
+                this.audioContext = null;
+            }
+            if (this.audioStream) {
+                try { this.audioStream.stop?.(); } catch (_) {}
+                try { this.audioStream.enabled = false; } catch (_) {}
+                this.audioStream = null;
             }
             
             // Setup audio waveform
@@ -400,15 +629,45 @@ class EmoTuneGothicClient {
             const perMin = (typeof perMinServer === 'number') ? perMinServer : (durSec > 0 ? (total / (durSec / 60.0)) : 0);
             document.getElementById('interactionRate').textContent = perMin.toFixed(2);
             document.getElementById('sessionDuration').textContent = durSec.toFixed(1) + 's';
-            // Use average_score as a proxy; can be replaced with server-provided stability
-            document.getElementById('emotionStability').textContent = (feedback.average_score || 0).toFixed(3);
+            // Prefer server stability metric if present in last emotion_update payload cache
+            const stability = (this._lastEmotionMetrics && typeof this._lastEmotionMetrics.stability === 'number')
+                ? this._lastEmotionMetrics.stability
+                : (feedback.average_score || 0);
+            document.getElementById('emotionStability').textContent = Number(stability).toFixed(3);
+            // Keep server duration cache only for diagnostics; progress is now locally driven
+            this._serverSessionDurationSec = durSec;
         }
 
         if (rlAgent) {
             document.getElementById('rlBufferSize').textContent = rlAgent.buffer_size || 0;
-            document.getElementById('rlLearningRate').textContent = (rlAgent.learning_rate || 0).toFixed(6);
-            document.getElementById('rlRewardSignal').textContent = (rlAgent.reward_signal || 0).toFixed(3);
-            document.getElementById('rlPolicyConfidence').textContent = (rlAgent.policy_confidence || 0).toFixed(3);
+            document.getElementById('rlLearningRate').textContent = (Number(rlAgent.learning_rate) || 0).toFixed(6);
+            document.getElementById('rlRewardSignal').textContent = (Number(rlAgent.reward_signal) || 0).toFixed(3);
+            document.getElementById('rlPolicyConfidence').textContent = (Number(rlAgent.policy_confidence) || 0).toFixed(3);
+            // RL Details panel
+            const latestReward = document.getElementById('rlLatestReward');
+            const rlAlpha = document.getElementById('rlAlpha');
+            const tableBody = document.getElementById('rlActionTable');
+            if (latestReward) latestReward.textContent = (Number(rlAgent.reward_signal) || 0).toFixed(3);
+            if (rlAlpha) rlAlpha.textContent = (Number(rlAgent.policy_confidence) || 0).toFixed(3);
+            if (tableBody) {
+                tableBody.innerHTML = '';
+                const params = rlAgent.params || {};
+                const actions = rlAgent.action || {};
+                Object.keys(params).forEach((key) => {
+                    const tr = document.createElement('tr');
+                    const tdK = document.createElement('td');
+                    const tdA = document.createElement('td');
+                    const tdP = document.createElement('td');
+                    const label = key.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase());
+                    tdK.textContent = label;
+                    const aVal = actions.hasOwnProperty(key) ? actions[key] : '-';
+                    const pVal = params.hasOwnProperty(key) ? params[key] : '-';
+                    tdA.textContent = (typeof aVal === 'number') ? aVal.toFixed(3) : (aVal ?? '-');
+                    tdP.textContent = (typeof pVal === 'number') ? pVal.toFixed(3) : (pVal ?? '-');
+                    tr.appendChild(tdK); tr.appendChild(tdA); tr.appendChild(tdP);
+                    tableBody.appendChild(tr);
+                });
+            }
         }
     }
     
@@ -459,7 +718,11 @@ class EmoTuneGothicClient {
             if (data.rl_agent) {
                 const rlLog = document.getElementById('rlLogs');
                 if (rlLog) {
-                    rlLog.textContent = `RL Agent: ${data.rl_agent.status || 'Unknown'}\nReward: ${data.rl_agent.reward_signal?.toFixed(3) || 'N/A'}\nAction: ${data.rl_agent.action || 'N/A'}`;
+                    const act = data.rl_agent.action || {};
+                    const actionStr = Object.keys(act).length
+                        ? Object.entries(act).map(([k, v]) => `${k}:${(typeof v === 'number' ? v.toFixed(3) : v)}`).join(', ')
+                        : 'N/A';
+                    rlLog.textContent = `RL Agent: ${data.rl_agent.status || 'Unknown'}\nReward: ${(Number(data.rl_agent.reward_signal) || 0).toFixed(3)}\nAction: ${actionStr}`;
                 }
                 this.updateRLDisplay(data.feedback, data.rl_agent);
             }
@@ -521,9 +784,13 @@ class EmoTuneGothicClient {
         if (this._trajectoryHistory) {
             this._trajectoryHistory.target_path = [];
             this._trajectoryHistory.actual_path = [];
-            this._trajectoryHistory.session_start_time = Date.now();
+            // FIX: Use server session start time if available, otherwise use current time
+            this._trajectoryHistory.session_start_time = (this.currentSession && this.currentSession.server_start_time) 
+                ? this.currentSession.server_start_time * 1000 
+                : Date.now();
         }
         
+        // Do not clear local progress timers here; they are reused across sessions
         // Force garbage collection if available
         if (window.gc) window.gc();
     }
@@ -550,7 +817,7 @@ class EmoTuneGothicClient {
     }
     
     _updateTrajectoryHistory(trajectoryProgress) {
-        // FIX: Maintain persistent trajectory history for continuous visualization
+        // FIXED: Maintain persistent trajectory history for continuous visualization
         if (!this._trajectoryHistory) {
             this._trajectoryHistory = {
                 target_path: [],
@@ -558,22 +825,31 @@ class EmoTuneGothicClient {
                 max_points: 300,   // Realistic limit for typical sessions
                 fade_start_threshold: 150,  // Start fading after ~5 minutes
                 fade_duration: 150,  // Fade over the same duration
-                session_start_time: Date.now()
+                // FIX: Use server session start time if available, otherwise use current time
+                session_start_time: (this.currentSession && this.currentSession.server_start_time) 
+                    ? this.currentSession.server_start_time * 1000 
+                    : Date.now()
             };
+        }
+        
+        // FIXED: Validate trajectory progress data before processing
+        if (!this._validateTrajectoryProgress(trajectoryProgress)) {
+            console.warn('Invalid trajectory progress data received');
+            return;
         }
         
         // Add new target path points (if provided)
         if (trajectoryProgress.target_path && Array.isArray(trajectoryProgress.target_path)) {
-            this._trajectoryHistory.target_path.push(...trajectoryProgress.target_path);
-            // FIX: Use smarter compression instead of simple truncation
-            this._compressPathIfNeeded('target_path');
+            // Replace with latest snapshot to avoid duplicate/fan connections
+            this._trajectoryHistory.target_path = trajectoryProgress.target_path.slice(0, this._trajectoryHistory.max_points);
+            this._addFadeEffectToOldPoints('target_path');
         }
         
         // Add new actual path points (if provided)
         if (trajectoryProgress.actual_path && Array.isArray(trajectoryProgress.actual_path)) {
-            this._trajectoryHistory.actual_path.push(...trajectoryProgress.actual_path);
-            // FIX: Use smarter compression instead of simple truncation
-            this._compressPathIfNeeded('actual_path');
+            // Replace with latest snapshot to maintain correct sequential connections
+            this._trajectoryHistory.actual_path = trajectoryProgress.actual_path.slice(0, this._trajectoryHistory.max_points);
+            this._addFadeEffectToOldPoints('actual_path');
         }
         
         // If no path data provided, try to add current position as a single point
@@ -607,14 +883,13 @@ class EmoTuneGothicClient {
     }
     
     _applyGradualAging(pathType) {
-        // FIX: Gradually fade out old trajectory points instead of sudden removal
+        // FIXED: Gradually fade out old trajectory points with improved removal rate
         const path = this._trajectoryHistory[pathType];
-        const fadeStart = this._trajectoryHistory.fade_start_threshold;
         const fadeDuration = this._trajectoryHistory.fade_duration;
         
-        // Calculate how many points to gradually remove
+        // FIXED: Calculate how many points to gradually remove - more aggressive cleanup
         const excessPoints = path.length - this._trajectoryHistory.max_points;
-        const pointsToRemove = Math.min(excessPoints, Math.floor(fadeDuration * 0.1)); // Remove 10% of fade duration
+        const pointsToRemove = Math.min(excessPoints, Math.max(1, Math.floor(excessPoints * 0.2))); // Remove 20% of excess points
         
         if (pointsToRemove > 0) {
             // Remove oldest points gradually (from the beginning)
@@ -626,14 +901,14 @@ class EmoTuneGothicClient {
     }
     
     _addFadeEffectToOldPoints(pathType) {
-        // FIX: Add visual fade effect to old trajectory points
+        // FIXED: Add visual fade effect to old trajectory points with correct logic
         const path = this._trajectoryHistory[pathType];
         const fadeDuration = this._trajectoryHistory.fade_duration;
         
-        // Add alpha/opacity property to points for fade effect
+        // FIXED: Add alpha/opacity property to points for fade effect - corrected calculation
         for (let i = 0; i < Math.min(path.length, fadeDuration); i++) {
-            const fadeRatio = i / fadeDuration;
-            const alpha = 0.3 + (fadeRatio * 0.7); // Fade from 0.3 to 1.0 opacity
+            const fadeRatio = (fadeDuration - i) / fadeDuration; // FIXED: Inverted ratio for correct fade (oldest = 1, newest = 0)
+            const alpha = 0.3 + (fadeRatio * 0.7); // Fade from 0.3 to 1.0 opacity (oldest to newest)
             path[i].alpha = alpha;
         }
         
@@ -775,13 +1050,27 @@ class EmoTuneGothicClient {
             
             if (result.success) {
                 this.showGothicNotification('Session started successfully', 'success');
-                document.getElementById('startSessionBtn').disabled = true;
-                document.getElementById('stopSessionBtn').disabled = false;
-                // Cache current session and join room explicitly
-                this.currentSession = { id: result.session_id, trajectory_type: trajectoryType, duration: duration, startTime: Date.now() };
+                
+                // FIX: Store session info with server-provided start time for proper synchronization
+                this.currentSession = { 
+                    id: result.session_id, 
+                    trajectory_type: trajectoryType, 
+                    duration: duration,
+                    // FIX: Use server-provided start time to avoid timer conflicts
+                    server_start_time: result.session_start_time || Date.now() / 1000
+                };
+                // Reset drift and kick ticker immediately for a fresh 0% start
+                this._progressDriftOffsetSec = 0;
+                this.startProgressUpdates();
+                
+                // FIX: Update UI to show session info and progress bar
+                this.updateSessionUI(true);
+                
                 if (this.socket) {
                     this.socket.emit('start_emotion_monitoring', { session_id: result.session_id });
                 }
+                // Ensure microphone visualizer is active after session start
+                try { await this.setupMediaCapture(); } catch (_) {}
             } else {
                 this.showGothicNotification(`Failed to start session: ${result.error}`, 'error');
             }
@@ -811,8 +1100,10 @@ class EmoTuneGothicClient {
                 // FIX: Clean up performance variables when manually stopping session
                 this._cleanupPerformanceVariables();
                 this.showGothicNotification('Session ended', 'info');
-                document.getElementById('startSessionBtn').disabled = false;
-                document.getElementById('stopSessionBtn').disabled = true;
+                
+                // FIX: Update UI to hide session info and progress bar
+                this.updateSessionUI(false);
+                
             } else {
                 this.showGothicNotification(`Failed to stop session: ${result.error}`, 'error');
             }
@@ -856,6 +1147,13 @@ class EmoTuneGothicClient {
 			this.updateEmotionDisplay(data.emotion_state);
 			// cache for feedback payloads
 			this.emotionState = data.emotion_state;
+			// NEW: update time-series buffer
+			this._updateTimeSeries(data.emotion_state);
+		}
+		
+		// NEW: cache emotion_metrics
+		if (data.emotion_metrics) {
+			this._lastEmotionMetrics = data.emotion_metrics;
 		}
 		
 		if (data.music_parameters) {
@@ -896,9 +1194,9 @@ class EmoTuneGothicClient {
             const centerX = circleRect.width / 2;
             const centerY = circleRect.height / 2;
             
-            // Convert valence/arousal to canvas coordinates
+            // Convert valence/arousal to canvas coordinates (both already in [-1,1])
             const x = centerX + (valence * centerX * 0.8);
-            const y = centerY - (arousal * centerY * 0.8);
+            const y = centerY - (this._normalizeArousal(arousal) * centerY * 0.8);
             
             emotionPoint.style.left = `${x}px`;
             emotionPoint.style.top = `${y}px`;
@@ -911,13 +1209,23 @@ class EmoTuneGothicClient {
     }
     
     updateTrajectoryVisualization(trajectoryProgress) {
-		if (!this.trajectoryCtx) return;
+		if (!this.trajectoryCtx) {
+			console.warn('Trajectory context not available');
+			return;
+		}
 		
-		// Throttle redraws to avoid UI stalls
+		console.log('Updating trajectory visualization with data:', trajectoryProgress);
+		
+		// FIXED: Enhanced throttling with adaptive intervals based on path complexity
 		const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 		if (this._lastTrajDrawAt === undefined) this._lastTrajDrawAt = 0;
-		if (this._trajDrawIntervalMs === undefined) this._trajDrawIntervalMs = 100; // ~10 FPS max
-		if (now - this._lastTrajDrawAt < this._trajDrawIntervalMs) {
+		
+		// FIXED: Adaptive interval based on path complexity for better performance
+		const pathComplexity = (this._trajectoryHistory?.actual_path?.length || 0) + 
+		                      (this._trajectoryHistory?.target_path?.length || 0);
+		const adaptiveInterval = Math.max(50, Math.min(200, 100 + pathComplexity * 0.5));
+		
+		if (now - this._lastTrajDrawAt < adaptiveInterval) {
 			// Save latest payload and schedule a redraw
 			this._pendingTrajectory = trajectoryProgress;
 			if (!this._trajRafScheduled) {
@@ -952,21 +1260,34 @@ class EmoTuneGothicClient {
 		const width = canvas.width;
 		const height = canvas.height;
 		
-		// Utility: decimate long paths to a reasonable number of points
+		// FIXED: Utility to decimate long paths to a reasonable number of points with improved algorithm
 		const decimate = (points, maxPoints) => {
 			if (!Array.isArray(points)) return [];
 			const n = points.length;
 			if (n <= maxPoints) return points;
-			const step = Math.ceil(n / maxPoints);
+			
+			// FIXED: Improved decimation algorithm to ensure exact number of points
+			const step = n / maxPoints;
 			const out = [];
-			for (let i = 0; i < n; i += step) out.push(points[i]);
-			if (out.length === 0 || out[out.length - 1] !== points[n - 1]) out.push(points[n - 1]);
+			
+			for (let i = 0; i < maxPoints; i++) {
+				const index = Math.floor(i * step);
+				out.push(points[index]);
+			}
+			
+			// Ensure last point is included
+			if (out.length > 0 && out[out.length - 1] !== points[n - 1]) {
+				out[out.length - 1] = points[n - 1];
+			}
+			
 			return out;
 		};
 		
 		// FIX: Use persistent trajectory history instead of just current data
 		const targetPath = decimate(this._trajectoryHistory.target_path || [], 300);
 		const actualPath = decimate(this._trajectoryHistory.actual_path || [], 300);
+		
+		console.log(`Drawing paths: target=${targetPath.length} points, actual=${actualPath.length} points`);
 		
 		// Clear canvas
 		ctx.fillStyle = '#1a1a1a';
@@ -975,7 +1296,7 @@ class EmoTuneGothicClient {
 		// Draw grid
 		this.drawTrajectoryGrid();
 		
-		// Draw target path (dashed line) with fade effect
+		// FIXED: Draw target path (dashed line) with fade effect and full canvas coordinates
 		if (targetPath.length > 1) {
 			ctx.lineWidth = 2;
 			ctx.setLineDash([5, 5]);
@@ -986,11 +1307,13 @@ class EmoTuneGothicClient {
 				const point2 = targetPath[i + 1];
 				const alpha1 = point1.alpha !== undefined ? point1.alpha : 1.0;
 				const alpha2 = point2.alpha !== undefined ? point2.alpha : 1.0;
+				const a1 = this._normalizeArousal(point1.arousal);
+				const a2 = this._normalizeArousal(point2.arousal);
 				
-				// Create gradient for this line segment
+				// FIXED: Create gradient for this line segment with full canvas coordinate transformation
 				const gradient = ctx.createLinearGradient(
-					(point1.valence + 1) * width / 2, (1 - point1.arousal) * height / 2,
-					(point2.valence + 1) * width / 2, (1 - point2.arousal) * height / 2
+					(point1.valence + 1) * width / 2, (1 - (a1 + 1) / 2) * height,
+					(point2.valence + 1) * width / 2, (1 - (a2 + 1) / 2) * height
 				);
 				
 				const color1 = `rgba(212, 175, 55, ${alpha1})`; // #d4af37 with alpha
@@ -1001,14 +1324,14 @@ class EmoTuneGothicClient {
 				
 				ctx.strokeStyle = gradient;
 				ctx.beginPath();
-				ctx.moveTo((point1.valence + 1) * width / 2, (1 - point1.arousal) * height / 2);
-				ctx.lineTo((point2.valence + 1) * width / 2, (1 - point2.arousal) * height / 2);
+				ctx.moveTo((point1.valence + 1) * width / 2, (1 - (a1 + 1) / 2) * height);
+				ctx.lineTo((point2.valence + 1) * width / 2, (1 - (a2 + 1) / 2) * height);
 				ctx.stroke();
 			}
 			ctx.setLineDash([]);
 		}
 		
-		// Draw actual path with fade effect
+		// FIXED: Draw actual path with fade effect and full canvas coordinates
 		if (actualPath.length > 1) {
 			ctx.lineWidth = 3;
 			
@@ -1018,11 +1341,13 @@ class EmoTuneGothicClient {
 				const point2 = actualPath[i + 1];
 				const alpha1 = point1.alpha !== undefined ? point1.alpha : 1.0;
 				const alpha2 = point2.alpha !== undefined ? point2.alpha : 1.0;
+				const a1 = this._normalizeArousal(point1.arousal);
+				const a2 = this._normalizeArousal(point2.arousal);
 				
-				// Create gradient for this line segment
+				// FIXED: Create gradient for this line segment with full canvas coordinate transformation
 				const gradient = ctx.createLinearGradient(
-					(point1.valence + 1) * width / 2, (1 - point1.arousal) * height / 2,
-					(point2.valence + 1) * width / 2, (1 - point2.arousal) * height / 2
+					(point1.valence + 1) * width / 2, (1 - (a1 + 1) / 2) * height,
+					(point2.valence + 1) * width / 2, (1 - (a2 + 1) / 2) * height
 				);
 				
 				const color1 = `rgba(139, 0, 0, ${alpha1})`; // #8b0000 with alpha
@@ -1033,17 +1358,18 @@ class EmoTuneGothicClient {
 				
 				ctx.strokeStyle = gradient;
 				ctx.beginPath();
-				ctx.moveTo((point1.valence + 1) * width / 2, (1 - point1.arousal) * height / 2);
-				ctx.lineTo((point2.valence + 1) * width / 2, (1 - point2.arousal) * height / 2);
+				ctx.moveTo((point1.valence + 1) * width / 2, (1 - (a1 + 1) / 2) * height);
+				ctx.lineTo((point2.valence + 1) * width / 2, (1 - (a2 + 1) / 2) * height);
 				ctx.stroke();
 			}
 		}
 		
-		// Draw current position
+		// FIXED: Draw current position with full canvas coordinates
 		if (actualPath.length > 0) {
 			const currentPoint = actualPath[actualPath.length - 1];
+			const aN = this._normalizeArousal(currentPoint.arousal);
 			const x = (currentPoint.valence + 1) * width / 2;
-			const y = (1 - currentPoint.arousal) * height / 2;
+			const y = (1 - (aN + 1) / 2) * height; // UPDATED: normalized arousal mapping
 			ctx.fillStyle = '#d4af37';
 			ctx.beginPath();
 			ctx.arc(x, y, 6, 0, 2 * Math.PI);
@@ -1054,13 +1380,21 @@ class EmoTuneGothicClient {
     drawTrajectoryGrid() {
         const canvas = this.trajectoryCanvas;
         const ctx = this.trajectoryCtx;
+        
+        if (!canvas || !ctx) {
+            console.error('Canvas or context not available for grid drawing');
+            return;
+        }
+        
         const width = canvas.width;
         const height = canvas.height;
+        
+        console.log('Drawing grid on canvas:', width, 'x', height);
         
         ctx.strokeStyle = '#404040';
         ctx.lineWidth = 1;
         
-        // Vertical lines
+        // FIXED: Vertical lines (valence axis) - correctly aligned
         for (let i = 0; i <= 4; i++) {
             const x = (i / 4) * width;
             ctx.beginPath();
@@ -1069,14 +1403,138 @@ class EmoTuneGothicClient {
             ctx.stroke();
         }
         
-        // Horizontal lines
-        for (let i = 0; i <= 4; i++) {
-            const y = (i / 4) * height;
+        // UPDATED: Horizontal lines (arousal axis) for symmetric range [-1,1]
+        const yTicks = [-1, -0.5, 0, 0.5, 1];
+        for (let i = 0; i < yTicks.length; i++) {
+            const y = (1 - (yTicks[i] + 1) / 2) * height;
             ctx.beginPath();
             ctx.moveTo(0, y);
             ctx.lineTo(width, y);
             ctx.stroke();
         }
+        
+        // UPDATED: Axis labels and tick values (symmetric)
+        ctx.fillStyle = '#a0a0a0';
+        ctx.font = '12px "Crimson Text", serif';
+        ctx.textAlign = 'center';
+        
+        // Valence ticks: -1.0 .. 1.0
+        const vTicks = [-1.0, -0.5, 0.0, 0.5, 1.0];
+        for (let i = 0; i < vTicks.length; i++) {
+            const x = ((vTicks[i] + 1) / 2) * width;
+            ctx.fillText(vTicks[i].toFixed(1), x, height - 6);
+        }
+        
+        // Arousal ticks: -1.0 .. 1.0
+        ctx.textAlign = 'right';
+        for (let i = 0; i < yTicks.length; i++) {
+            const y = (1 - (yTicks[i] + 1) / 2) * height;
+            ctx.fillText(yTicks[i].toFixed(1), 34, y + 4);
+        }
+        
+        // Axis titles
+        ctx.textAlign = 'center';
+        ctx.fillText('Valence', width / 2, height - 20);
+        ctx.save();
+        ctx.translate(14, height / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText('Arousal', 0, 0);
+        ctx.restore();
+    }
+    
+    // DEBUG: Function to test trajectory drawing manually
+    testTrajectoryDrawing() {
+        console.log('Testing trajectory drawing...');
+        
+        if (!this.trajectoryCtx) {
+            console.error('No trajectory context available');
+            return;
+        }
+        
+        // Clear canvas
+        const canvas = this.trajectoryCanvas;
+        const ctx = this.trajectoryCtx;
+        const width = canvas.width;
+        const height = canvas.height;
+        
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(0, 0, width, height);
+        
+        // Draw grid
+        this.drawTrajectoryGrid();
+        
+        // Create test trajectory data
+        const testActualPath = [
+            { valence: -0.8, arousal: 0.2 },
+            { valence: -0.4, arousal: 0.4 },
+            { valence: 0.0, arousal: 0.6 },
+            { valence: 0.4, arousal: 0.5 },
+            { valence: 0.8, arousal: 0.3 }
+        ];
+        
+        const testTargetPath = [
+            { valence: -0.7, arousal: 0.3 },
+            { valence: -0.3, arousal: 0.5 },
+            { valence: 0.1, arousal: 0.7 },
+            { valence: 0.5, arousal: 0.6 },
+            { valence: 0.9, arousal: 0.4 }
+        ];
+        
+        // Draw target path (dashed)
+        if (testTargetPath.length > 1) {
+            ctx.lineWidth = 2;
+            ctx.setLineDash([5, 5]);
+            ctx.strokeStyle = '#d4af37';
+            
+            ctx.beginPath();
+            for (let i = 0; i < testTargetPath.length - 1; i++) {
+                const point1 = testTargetPath[i];
+                const point2 = testTargetPath[i + 1];
+                
+                const x1 = (point1.valence + 1) * width / 2;
+                const y1 = (1 - point1.arousal) * height;
+                const x2 = (point2.valence + 1) * width / 2;
+                const y2 = (1 - point2.arousal) * height;
+                
+                if (i === 0) ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+            }
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+        
+        // Draw actual path (solid)
+        if (testActualPath.length > 1) {
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#8b0000';
+            
+            ctx.beginPath();
+            for (let i = 0; i < testActualPath.length - 1; i++) {
+                const point1 = testActualPath[i];
+                const point2 = testActualPath[i + 1];
+                
+                const x1 = (point1.valence + 1) * width / 2;
+                const y1 = (1 - point1.arousal) * height;
+                const x2 = (point2.valence + 1) * width / 2;
+                const y2 = (1 - point2.arousal) * height;
+                
+                if (i === 0) ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+            }
+            ctx.stroke();
+        }
+        
+        // Draw current position
+        const currentPoint = testActualPath[testActualPath.length - 1];
+        const x = (currentPoint.valence + 1) * width / 2;
+        const y = (1 - currentPoint.arousal) * height;
+        
+        ctx.fillStyle = '#d4af37';
+        ctx.beginPath();
+        ctx.arc(x, y, 6, 0, 2 * Math.PI);
+        ctx.fill();
+        
+        console.log('Test trajectory drawing completed');
     }
     
     updateMusicParameters(musicParams) {
@@ -1107,24 +1565,43 @@ class EmoTuneGothicClient {
     }
     
     updateSessionUI(active) {
+        console.log(`updateSessionUI called with active: ${active}`);
+        
         const sessionInfo = document.getElementById('sessionInfo');
         const startBtn = document.getElementById('startSessionBtn');
         const stopBtn = document.getElementById('stopSessionBtn');
         
+        if (!sessionInfo) {
+            console.warn('sessionInfo element not found');
+            return;
+        }
+        
         if (active) {
+            console.log('Showing session info');
             sessionInfo.style.display = 'block';
             startBtn.disabled = true;
             stopBtn.disabled = false;
             
             // Update session info
             if (this.currentSession) {
-                document.getElementById('currentGoal').textContent = this.currentSession.trajectory_type;
-                document.getElementById('currentDuration').textContent = `${this.currentSession.duration} minutes`;
+                const currentGoal = document.getElementById('currentGoal');
+                const currentDuration = document.getElementById('currentDuration');
+                
+                if (currentGoal) currentGoal.textContent = this.currentSession.trajectory_type;
+                if (currentDuration) currentDuration.textContent = `${this.currentSession.duration} minutes`;
+                
+                console.log(`Session info updated: ${this.currentSession.trajectory_type}, ${this.currentSession.duration} minutes`);
             }
             
-            // Start progress updates
-            this.updateSessionProgress();
+            // Reset progress bar to 0 and restart ticker for a fresh session
+            const progressFill = document.getElementById('sessionProgress');
+            const progressText = document.getElementById('progressText');
+            if (progressFill) progressFill.style.width = '0%';
+            if (progressText) progressText.textContent = '0%';
+            this._progressDriftOffsetSec = 0;
+            this.startProgressUpdates();
         } else {
+            console.log('Hiding session info');
             sessionInfo.style.display = 'none';
             startBtn.disabled = false;
             stopBtn.disabled = true;
@@ -1133,22 +1610,20 @@ class EmoTuneGothicClient {
         }
     }
     
-    updateSessionProgress() {
+    // FIX: Update session progress using local timer synced to server start time
+    async updateSessionProgress() {
         if (!this.currentSession) return;
-        
-        const elapsed = (Date.now() - this.currentSession.startTime) / 1000;
-        const totalSeconds = this.currentSession.duration * 60;
-        const progress = Math.min((elapsed / totalSeconds) * 100, 100);
-        
         const progressFill = document.getElementById('sessionProgress');
         const progressText = document.getElementById('progressText');
-        
-        progressFill.style.width = `${progress}%`;
-        progressText.textContent = `${Math.round(progress)}%`;
-        
-        if (progress < 100) {
-            setTimeout(() => this.updateSessionProgress(), 1000);
-        }
+        if (!progressFill || !progressText) return;
+        const totalSeconds = Math.max(0, (this.currentSession.duration || 0) * 60);
+        if (totalSeconds <= 0) return;
+        const nowSec = Date.now() / 1000;
+        const baseStart = this.currentSession.server_start_time || (this.currentSession.startTime ? this.currentSession.startTime / 1000 : nowSec);
+        const elapsed = Math.max(0, (nowSec - baseStart) + (this._progressDriftOffsetSec || 0));
+        const pct = Math.round(Math.min(Math.max(elapsed / totalSeconds, 0), 1) * 100);
+        progressFill.style.width = `${pct}%`;
+        progressText.textContent = `${pct}%`;
     }
     
     selectRating(selectedBtn) {
@@ -1198,13 +1673,26 @@ class EmoTuneGothicClient {
             
             if (response.ok) {
                 this.showGothicNotification('Feedback submitted successfully', 'success');
+                // Mark feedback toast time to suppress overlapping monitoring toast
+                this._lastFeedbackToastAt = Date.now();
                 // Ensure we remain subscribed to updates after feedback
                 if (this.currentSession && this.currentSession.id && this.socket) {
                     this.socket.emit('start_emotion_monitoring', { session_id: this.currentSession.id });
                 }
             } else {
-                const errorData = await response.json();
-                this.showGothicNotification(`Failed to submit feedback: ${errorData.message}`, 'error');
+                let errMsg = '';
+                try {
+                    const ct = response.headers.get('content-type') || '';
+                    if (ct.includes('application/json')) {
+                        const err = await response.json();
+                        errMsg = err.error || err.message || response.statusText;
+                    } else {
+                        errMsg = await response.text();
+                    }
+                } catch (_) {
+                    errMsg = response.statusText || 'Unknown error';
+                }
+                this.showGothicNotification(`Failed to submit feedback: ${errMsg}`, 'error');
             }
         } catch (error) {
             this.showGothicNotification(`Error: ${error.message}`, 'error');
@@ -1290,6 +1778,14 @@ class EmoTuneGothicClient {
             this.trajectoryCtx.fillRect(0, 0, c.width, c.height);
             this.drawTrajectoryGrid();
         }
+        // NEW: clear time-series canvas
+        if (this.timeseriesCtx && this.timeseriesCanvas) {
+            const c2 = this.timeseriesCanvas;
+            this.timeseriesCtx.fillStyle = '#1a1a1a';
+            this.timeseriesCtx.fillRect(0, 0, c2.width, c2.height);
+            this.drawTimeSeriesAxes();
+            this._tsHistory = [];
+        }
         // Reset indicators
         const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
         ['faceV','faceA','faceC','faceUsed','voiceV','voiceA','voiceC','voiceUsed'].forEach(id => set(id, '-'));
@@ -1302,6 +1798,176 @@ class EmoTuneGothicClient {
         }
     }
 }
+
+// NEW: Time-series canvas and rendering helpers
+EmoTuneGothicClient.prototype.setupTimeSeriesCanvas = function() {
+    this.timeseriesCanvas = document.getElementById('timeseriesCanvas');
+    if (!this.timeseriesCanvas) return;
+    this.timeseriesCtx = this.timeseriesCanvas.getContext('2d');
+    this._resizeTimeSeriesCanvas();
+    this.drawTimeSeriesAxes();
+};
+
+EmoTuneGothicClient.prototype._resizeTimeSeriesCanvas = function() {
+    if (!this.timeseriesCanvas) return;
+    const rect = this.timeseriesCanvas.getBoundingClientRect();
+    this.timeseriesCanvas.width = rect.width;
+    this.timeseriesCanvas.height = rect.height;
+};
+
+EmoTuneGothicClient.prototype.drawTimeSeriesAxes = function() {
+    if (!this.timeseriesCtx || !this.timeseriesCanvas) return;
+    const ctx = this.timeseriesCtx;
+    const c = this.timeseriesCanvas;
+    const w = c.width;
+    const h = c.height;
+
+    // Background
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(0, 0, w, h);
+
+    // Axes
+    ctx.strokeStyle = '#404040';
+    ctx.lineWidth = 1;
+
+    // Y-grid for symmetric valence -1..1
+    for (let i = -1; i <= 1; i += 0.5) {
+        const y = ((1 - (i + 1) / 2)) * h;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+    }
+
+    // Labels
+    ctx.fillStyle = '#a0a0a0';
+    ctx.font = '12px "Crimson Text", serif';
+    ctx.textAlign = 'left';
+
+    // Valence labels (left)
+    const vTicks = [-1, -0.5, 0, 0.5, 1];
+    for (const v of vTicks) {
+        const y = ((1 - (v + 1) / 2)) * h;
+        ctx.fillText(v.toFixed(1), 6, y - 2);
+    }
+
+    // Arousal labels (right) - symmetric
+    ctx.textAlign = 'right';
+    const aTicks = [-1, -0.5, 0, 0.5, 1];
+    for (const a of aTicks) {
+        const y = ((1 - (a + 1) / 2)) * h;
+        ctx.fillText(a.toFixed(1), w - 6, y - 2);
+    }
+
+    // Title
+    ctx.textAlign = 'center';
+    ctx.fillText('Valence and Arousal vs Time', w / 2, 14);
+
+    // Legend uses color only (red=valence, gold=arousal)
+    ctx.fillStyle = '#8b0000';
+    ctx.fillRect(w / 2 - 90, 22, 14, 3);
+    ctx.fillStyle = '#a0a0a0';
+    ctx.fillText('Valence', w / 2 - 60, 26);
+    ctx.fillStyle = '#d4af37';
+    ctx.fillRect(w / 2 + 20, 22, 14, 3);
+    ctx.fillStyle = '#a0a0a0';
+    ctx.fillText('Arousal', w / 2 + 54, 26);
+};
+
+EmoTuneGothicClient.prototype._updateTimeSeries = function(emotionState) {
+    if (!emotionState) return;
+    const ts = (typeof emotionState.timestamp === 'number') ? emotionState.timestamp * 1000 : Date.now();
+    const v = typeof emotionState.valence === 'number' ? emotionState.valence : (emotionState.mean?.valence ?? 0);
+    const a = typeof emotionState.arousal === 'number' ? emotionState.arousal : (emotionState.mean?.arousal ?? 0);
+
+    this._tsHistory.push({ t: ts, v, a });
+
+    // Prune by window seconds and max points
+    const cutoff = Date.now() - this._tsWindowSeconds * 1000;
+    while (this._tsHistory.length > 0 && this._tsHistory[0].t < cutoff) {
+        this._tsHistory.shift();
+    }
+    if (this._tsHistory.length > this._tsMaxPoints) {
+        this._tsHistory = this._tsHistory.slice(-this._tsMaxPoints);
+    }
+
+    // Throttle drawing
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (now - this._lastTsDrawAt < this._tsUpdateIntervalMs) {
+        if (!this._pendingTs) {
+            this._pendingTs = true;
+            requestAnimationFrame(() => {
+                this._pendingTs = false;
+                this.updateTimeSeriesVisualization();
+            });
+        }
+        return;
+    }
+    this._lastTsDrawAt = now;
+    this.updateTimeSeriesVisualization();
+};
+
+EmoTuneGothicClient.prototype.updateTimeSeriesVisualization = function(forceRedraw = false) {
+    if (!this.timeseriesCtx || !this.timeseriesCanvas) return;
+    const ctx = this.timeseriesCtx;
+    const c = this.timeseriesCanvas;
+    const w = c.width;
+    const h = c.height;
+
+    // Background and axes
+    this.drawTimeSeriesAxes();
+
+    if (this._tsHistory.length < 2) return;
+
+    // Compute time window
+    const tMin = this._tsHistory[0].t;
+    const tMax = this._tsHistory[this._tsHistory.length - 1].t;
+    const span = Math.max(1000, tMax - tMin);
+
+    // Helpers to map
+    const xFor = (t) => ((t - tMin) / span) * (w - 40) + 20; // padding 20px
+    const yForValence = (v) => ((1 - (v + 1) / 2)) * (h - 40) + 20; // -1..1 -> 1..0, padded
+    // UPDATED: normalize arousal that might arrive as 0..1
+    const yForArousal = (a) => {
+        const an = (a >= 0 && a <= 1) ? (a * 2 - 1) : a;
+        return ((1 - (an + 1) / 2)) * (h - 40) + 20;
+    };
+
+    // Plot valence
+    ctx.strokeStyle = '#8b0000';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < this._tsHistory.length; i++) {
+        const p = this._tsHistory[i];
+        const x = xFor(p.t);
+        const y = yForValence(p.v);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Plot arousal
+    ctx.strokeStyle = '#d4af37';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < this._tsHistory.length; i++) {
+        const p = this._tsHistory[i];
+        const x = xFor(p.t);
+        const y = yForArousal(p.a);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // X-axis time labels (start, mid, end)
+    ctx.fillStyle = '#a0a0a0';
+    ctx.font = '12px "Crimson Text", serif';
+    ctx.textAlign = 'center';
+    const labels = [tMin, tMin + span / 2, tMax];
+    labels.forEach((t) => {
+        const x = xFor(t);
+        const secsAgo = Math.max(0, Math.round((tMax - t) / 1000));
+        ctx.fillText(`${secsAgo}s ago`, x, h - 6);
+    });
+};
 
 // Initialize the gothic client when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {

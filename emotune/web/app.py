@@ -1,6 +1,7 @@
 import os
 import json
 import sys
+import time
 from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO, emit
 from types import SimpleNamespace
@@ -122,33 +123,28 @@ def create_app(db):
 
     @app.route('/session/start', methods=['POST'])
     def start_session():
+        """Start a new session"""
         try:
-            if not session_manager:
-                return jsonify({
-                    'success': False,
-                    'error': 'Session manager not available'
-                }), 500
-                
             data = request.get_json()
             trajectory_type = data.get('trajectory_type', 'calm_down')
             duration = int(data.get('duration', 300))
-
+            
             session_id = session_manager.start_session(trajectory_type, duration)
+            
+            # Store session id in Flask session for subsequent HTTP routes (e.g., /feedback)
             session['session_id'] = session_id
-            # Emit session status to frontend
-            socketio.emit('session_status', {'active': True, 'session_id': session_id, 'trajectory_type': trajectory_type, 'duration': duration})
+            
+            # FIX: Return session start time to client for proper timer synchronization
+            session_start_time = session_manager.session_start_time
+            
             return jsonify({
-                'success': True,
+                'success': True, 
                 'session_id': session_id,
-                'message': 'Session started'
+                'session_start_time': session_start_time  # FIX: Send server start time to client
             })
         except Exception as e:
-            logger.error(f"Error starting session: {e}")
-            socketio.emit('error', {'message': str(e)})
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
+            logger.error(f"Failed to start session: {e}")
+            return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/session/stop', methods=['POST'])
     def stop_session():
@@ -225,6 +221,39 @@ def create_app(db):
         except Exception as e:
             logger.error(f"Failed to submit feedback: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route('/audio/status')
+    def get_audio_status():
+        logger.info("[GET /audio/status] Called")
+        try:
+            if not session_manager:
+                return jsonify({'success': False, 'error': 'Session manager not available'}), 500
+            
+            status = session_manager.check_audio_status()
+            return jsonify({'success': True, 'audio_status': status})
+        except Exception as e:
+            logger.error(f"Failed to get audio status: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route('/session/duration', methods=['GET'])
+    def get_session_duration():
+        """Get current session duration"""
+        try:
+            if not session_manager:
+                return jsonify({'duration': 0.0, 'active': False, 'error': 'No session manager'})
+            
+            if not hasattr(session_manager, 'session_start_time') or not session_manager.session_start_time:
+                return jsonify({'duration': 0.0, 'active': False, 'error': 'No session start time'})
+            
+            duration = time.time() - session_manager.session_start_time
+            return jsonify({
+                'duration': duration,
+                'active': session_manager.running,
+                'session_start_time': session_manager.session_start_time
+            })
+        except Exception as e:
+            logger.error(f"Failed to get session duration: {e}")
+            return jsonify({'duration': 0.0, 'active': False, 'error': str(e)})
 
     # --- SESSION UUID TO SOCKETIO SID MAPPING ---
     session_uuid_to_sid = {}
@@ -553,6 +582,19 @@ def create_app(db):
         else:
             emit('error', {'message': 'Session manager not available'})
 
+    @socketio.on('ui_interaction')
+    def on_ui_interaction(data):
+        try:
+            itype = (data or {}).get('type', 'generic')
+            intensity = float((data or {}).get('intensity', 1.0))
+            if session_manager and hasattr(session_manager, 'feedback_collector'):
+                session_manager.feedback_collector.collect_implicit_feedback(itype, intensity)
+                emit('implicit_feedback_ack', {'success': True})
+            else:
+                emit('implicit_feedback_ack', {'success': False, 'error': 'feedback collector unavailable'})
+        except Exception as e:
+            emit('implicit_feedback_ack', {'success': False, 'error': str(e)})
+
     @socketio.on('start_session')
     def on_start_session(data):
         trajectory = data.get('trajectory', 'default')
@@ -592,6 +634,18 @@ def create_app(db):
         logger.info("[SocketIO] Regenerate music request received")
         if session_manager:
             session_manager.regenerate_music()
+
+    @socketio.on('set_rl_scale')
+    def on_set_rl_scale(data):
+        try:
+            scale = float((data or {}).get('scale', 1.0))
+            if session_manager:
+                session_manager.rl_debug_scale = max(0.0, min(5.0, scale))
+                emit('rl_scale_updated', {'success': True, 'scale': session_manager.rl_debug_scale})
+            else:
+                emit('rl_scale_updated', {'success': False, 'error': 'session manager unavailable'})
+        except Exception as e:
+            emit('rl_scale_updated', {'success': False, 'error': str(e)})
 
     @socketio.on('submit_feedback')
     def on_submit_feedback(data):

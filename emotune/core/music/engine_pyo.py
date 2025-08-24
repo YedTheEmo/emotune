@@ -12,7 +12,7 @@ from emotune.utils.logging import get_logger
 
 # Pyo imports (will be handled gracefully if not available)
 try:
-    from pyo import Server, Mixer, Sine, Freeverb, ButLP, Fader, Adsr, Pattern
+    from pyo import Server, Mixer, Sine, Freeverb, ButLP, Fader, Adsr, Pattern, midiToHz
     PYO_AVAILABLE = True
 except Exception as e:
     PYO_AVAILABLE = False
@@ -34,7 +34,6 @@ class PyoMusicEngine(MusicEngineBase):
         self.sample_rate = sample_rate
         self.buffer_size = buffer_size
         self.audio_backend = audio_backend
-        
         # Pyo server and components
         self.server = None
         self.mixer = None
@@ -43,6 +42,15 @@ class PyoMusicEngine(MusicEngineBase):
         self.pattern_player = None # Initialize pattern_player
         self.active_notes = [] # Use a simple list for manual management
         self.max_active_notes = 100 # Prevent too many simultaneous notes
+        # --- Musical structure additions ---
+        self.scale_notes = [60, 62, 64, 65, 67, 69, 71, 72]  # C major scale (MIDI)
+        self.rhythm_pattern = [0.5, 0.5, 1, 0.5, 0.5, 1, 0.5, 1]  # Rhythm pattern (seconds)
+        self.scale_idx = 0
+        self.chord_type = 'major'  # Will be set dynamically
+        self.section_length = 8  # Number of notes per section
+        self.polyphony = 2  # Number of simultaneous voices
+        self.oscillators = []  # List of active oscillators
+        self.envelopes = []    # List of active envelopes
         
         # Threading for real-time updates
         self.update_thread = None
@@ -73,10 +81,18 @@ class PyoMusicEngine(MusicEngineBase):
             # Allow a moment for the server to stabilize, especially with wasapi
             time.sleep(0.5)
 
+            # Initialize mixer with a fixed voice pool and track assignments
+            self._mixer_voices = 8
+            self._mixer_voice_idx = 0
+            self._voice_slots = [None] * self._mixer_voices  # (osc, env) tuples
+            self.mixer = Mixer(outs=2, chnls=self._mixer_voices, time=0.025)
+            # Initialize default amps for all voices (stereo)
+            for v in range(self._mixer_voices):
+                self.mixer.setAmp(v, 0, 0.5)
+                self.mixer.setAmp(v, 1, 0.5)
+            self.mixer.out()
+
             # ---------- SINGLE-OSCILLATOR MODEL ----------
-            # One global sine oscillator plus envelope.  No new PortAudio
-            # handles are ever allocated after startup.
-            # Will be built lazily the first time play() is called.
             self.main_osc = None
             self.env = None
             
@@ -176,8 +192,15 @@ class PyoMusicEngine(MusicEngineBase):
         """Update overall volume"""
         if self.mixer:
             vol = max(0.0, min(1.0, volume))
-            self.mixer.setAmp(0, 0, vol)  # channel, input, amp
-            self.mixer.setAmp(1, 0, vol)  # channel, input, amp
+            voices = getattr(self, '_mixer_voices', 1)
+            for v in range(voices):
+                # set stereo amps per voice
+                try:
+                    self.mixer.setAmp(v, 0, vol)
+                    self.mixer.setAmp(v, 1, vol)
+                except Exception:
+                    # best-effort if voice index invalid
+                    pass
     
     def _update_synthesis_parameters(self, params: Dict[str, float]):
         """Update synthesis parameters with proper type conversion"""
@@ -323,37 +346,131 @@ class PyoMusicEngine(MusicEngineBase):
         return pattern
     
     def _generate_musical_content(self, pattern: Dict[str, Any]):
-        """Generate musical content using Patterns for melody and rhythm."""
+        """Generate musical content using scale-based melody, chord progression, and rhythm."""
         if not self.server or not self.running:
             return
-
+        # Stop previous pattern if running
         if self.pattern_player and self.pattern_player.isPlaying():
             self.pattern_player.stop()
-
-        self.pattern_player = Pattern(
-            self._play_note,
-            time=1.0 / (pattern.get('tempo_bpm', 120) / 60.0)
-        ).play()
+        # Set musical parameters
+        tempo_bpm = pattern.get('tempo_bpm', 120)
+        # Derive rhythmic subdivision from arousal (higher arousal -> shorter steps)
+        arousal = float(pattern.get('arousal', 0.0)) if 'arousal' in pattern else 0.0
+        base_step = 0.25 if arousal > 0.5 else 0.5
+        self.rhythm_pattern = [base_step] * 4 + [base_step * 2, base_step, base_step * 2, base_step]
+        self.section_length = int(pattern.get('section_length', 8)) if 'section_length' in pattern else 8
+        self.polyphony = int(pattern.get('voice_density', 2))
+        # Choose scale and chord type based on valence
+        valence = float(pattern.get('valence', 0)) if 'valence' in pattern else 0.0
+        if valence > 0:
+            # Positive: brighter key
+            self.scale_notes = [60, 62, 64, 65, 67, 69, 71, 72]  # C major
+            self.chord_type = 'major'
+        else:
+            # Negative: minor mode
+            self.scale_notes = [57, 59, 60, 62, 64, 65, 67, 69]  # A minor
+            self.chord_type = 'minor'
+        # Clear previous oscillators/envelopes
+        for osc in self.oscillators:
+            if hasattr(osc, 'stop'): osc.stop()
+        self.oscillators = []
+        self.envelopes = []
+        # Start pattern
+        self._section_counter = 0
+        self.pattern_player = Pattern(self._play_note, time=self.rhythm_pattern[0]).play()
 
     def _play_note(self):
         """
-        Creates a new sine wave oscillator with its own envelope for each note.
-        Manages a list of active notes, explicitly stopping the oldest note
-        when the list becomes too large. This ensures graceful resource cleanup.
+        Play a note from the scale, using a chord for harmony and polyphony.
+        Uses Adsr envelope and Sine oscillator (PYO 1.05 verified).
         """
         try:
-            freq = self._get_next_note()
-
-            # Lazily create oscillator on first note
-            if self.main_osc is None:
-                self.env = Fader(fadein=0.01, fadeout=0.1, mul=0.4).play()
-                self.main_osc = Sine(freq=freq, mul=self.env).out()
-            else:
-                self.main_osc.setFreq(freq)
-                # retrigger envelope for new note
-                if self.env is not None:
-                    self.env.stop(); self.env.play()
-            
+            # PYO 1.0.5 SAFETY: Skip if server not booted or engine not running
+            if not self.running or self.server is None:
+                return
+            try:
+                if hasattr(self.server, 'getIsBooted') and not self.server.getIsBooted():
+                    return
+            except Exception:
+                # If API missing, proceed cautiously
+                pass
+            if self.mixer is None:
+                return
+            # Change key/progression every section_length notes
+            if self._section_counter % max(1, self.section_length) == 0 and self._section_counter > 0:
+                # Rotate scale root to introduce movement
+                root_shift = int(np.random.choice([-2, 0, 2]))  # step down, same, or up
+                self.scale_notes = [n + root_shift for n in self.scale_notes]
+            # Get current note and chord
+            note = self.scale_notes[self.scale_idx % len(self.scale_notes)]
+            chord = self._generate_chord(midiToHz(note), self._latest_pattern if hasattr(self, '_latest_pattern') else {})
+            # Polyphony: play up to self.polyphony notes from chord
+            for i in range(self.polyphony):
+                freq = chord[i % len(chord)] if chord else midiToHz(note)
+                env = Adsr(attack=0.01, decay=0.12, sustain=0.65, release=0.25, dur=self.rhythm_pattern[self.scale_idx % len(self.rhythm_pattern)], mul=0.25).play()
+                osc = Sine(freq=freq, mul=env)
+                # Assign to a mixer voice with cleanup and reuse
+                vidx = getattr(self, '_mixer_voice_idx', 0)
+                voices = getattr(self, '_mixer_voices', 1)
+                # If a previous osc is assigned on this voice, remove and stop it
+                prev = None
+                try:
+                    prev = self._voice_slots[vidx]
+                except Exception:
+                    prev = None
+                if prev is not None:
+                    try:
+                        p_osc, p_env = prev
+                        if hasattr(p_env, 'stop'):
+                            p_env.stop()
+                        if hasattr(p_osc, 'stop'):
+                            p_osc.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.mixer.delInput(vidx)
+                    except Exception:
+                        pass
+                # Add new osc to mixer voice
+                try:
+                    self.mixer.addInput(vidx, osc)
+                    # Ensure amps present for this voice using current volume
+                    try:
+                        vol = float(self.parameter_cache.get('overall_volume', 0.5))
+                    except Exception:
+                        vol = 0.5
+                    self.mixer.setAmp(vidx, 0, vol)
+                    self.mixer.setAmp(vidx, 1, vol)
+                    self._voice_slots[vidx] = (osc, env)
+                except Exception as e:
+                    self.logger.debug(f"Mixer addInput failed: {e}")
+                    # If mixer rejects, stop objects to avoid leaks
+                    try:
+                        env.stop()
+                        osc.stop()
+                    except Exception:
+                        pass
+                    self._voice_slots[vidx] = None
+                # advance voice index
+                self._mixer_voice_idx = (vidx + 1) % max(1, voices)
+                self.oscillators.append(osc)
+                self.envelopes.append(env)
+            # Cleanup old oscillators/envelopes
+            if len(self.oscillators) > self.polyphony * self.section_length:
+                for osc in self.oscillators[:-self.polyphony * self.section_length]:
+                    if hasattr(osc, 'stop'): osc.stop()
+                self.oscillators = self.oscillators[-self.polyphony * self.section_length:]
+            if len(self.envelopes) > self.polyphony * self.section_length:
+                for env in self.envelopes[:-self.polyphony * self.section_length]:
+                    if hasattr(env, 'stop'): env.stop()
+                self.envelopes = self.envelopes[-self.polyphony * self.section_length:]
+            # Advance indices
+            self.scale_idx += 1
+            self._section_counter += 1
+            # Update pattern timing for next note
+            next_time = self.rhythm_pattern[self.scale_idx % len(self.rhythm_pattern)]
+            if self.pattern_player:
+                self.pattern_player.time = next_time
         except Exception as e:
             self.logger.error(f"Error in _play_note: {e}")
 
@@ -547,9 +664,16 @@ class PyoMusicEngine(MusicEngineBase):
             self.running = False
             if self.update_thread and self.update_thread.is_alive():
                 self.update_thread.join(timeout=1.0)
+            # PYO 1.0.5: Stop pattern before any server/mixer teardown to prevent callbacks
+            try:
+                if self.pattern_player and hasattr(self.pattern_player, 'isPlaying') and self.pattern_player.isPlaying():
+                    self.pattern_player.stop()
+            except Exception:
+                pass
+            self.pattern_player = None
             
             # FIXED: Use a fader for smooth fade-out with correct API.
-            if self.mixer:
+            if self.mixer and self.server and (not hasattr(self.server, 'getIsBooted') or self.server.getIsBooted()):
                 # The old getMul()/getAdd() are deprecated. Access attributes directly.
                 fader = Fader(fadeout=0.5, mul=self.mixer.mul, add=self.mixer.add).play()
                 time.sleep(0.5)
@@ -578,6 +702,21 @@ class PyoMusicEngine(MusicEngineBase):
     def _clear_patterns(self):
         """Stop and clear all current oscillators."""
         if not self.current_patterns:
+            # Even if no patterns, ensure mixer voices cleared
+            if getattr(self, '_voice_slots', None) is not None:
+                for vidx, slot in enumerate(self._voice_slots):
+                    try:
+                        if slot:
+                            o, e = slot
+                            if hasattr(e, 'stop'): e.stop()
+                            if hasattr(o, 'stop'): o.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.mixer.delInput(vidx)
+                    except Exception:
+                        pass
+                self._voice_slots = [None] * getattr(self, '_mixer_voices', 0)
             return
         
         for osc in self.current_patterns.values():
@@ -585,8 +724,27 @@ class PyoMusicEngine(MusicEngineBase):
                 osc.stop()
         self.current_patterns.clear()
         self.active_notes.clear() # Also clear the active_notes list
-        self.mixer.clear() # Clear inputs from the mixer
-        self.mixer.out() # Re-route mixer to output after clearing
+        # Guard mixer operations for Pyo 1.0.5 compatibility: remove inputs per voice
+        if self.mixer:
+            try:
+                for vidx, slot in enumerate(self._voice_slots):
+                    try:
+                        if slot:
+                            o, e = slot
+                            if hasattr(e, 'stop'): e.stop()
+                            if hasattr(o, 'stop'): o.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self.mixer.delInput(vidx)
+                    except Exception:
+                        pass
+                self._voice_slots = [None] * getattr(self, '_mixer_voices', 0)
+                # keep mixer routed
+                if self.server and (not hasattr(self.server, 'getIsBooted') or self.server.getIsBooted()):
+                    self.mixer.out()
+            except Exception as e:
+                self.logger.debug(f"Mixer clear/out failed: {e}")
     
     def get_status(self) -> Dict[str, Any]:
         """Get current engine status"""

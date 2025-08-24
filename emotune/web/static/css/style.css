@@ -554,10 +554,21 @@ body::before {
     margin-bottom: 15px;
 }
 
+/* Override: make therapeutic trajectory canvas square */
+#trajectoryCanvas.gothic-canvas {
+    height: auto;
+    aspect-ratio: 1 / 1;
+}
+
+/* Keep time-series canvas at fixed height */
+#timeseriesCanvas.gothic-canvas {
+    height: 300px;
+}
+
 /* Music Grid */
 .music-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    grid-template-columns: 1fr;
     gap: 20px;
     margin-bottom: 20px;
 }
@@ -761,9 +772,10 @@ body::before {
 /* Log Panel Styles */
 .log-container {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
     gap: 16px;
-    max-height: 400px;
+    max-height: none;
+    height: auto;
     overflow-y: auto;
 }
 

@@ -47,6 +47,14 @@
                             <input type="range" id="fusionMinConfSlider" min="0.0" max="1.0" value="0.1" step="0.05" class="gothic-slider">
                         </div>
                         <div class="form-group">
+                            <label for="fusionBalanceSlider">Fusion Balance (Face↔Voice): <span id="fusionBalanceValue">0.70 / 0.30</span></label>
+                            <input type="range" id="fusionBalanceSlider" min="0.0" max="1.0" value="0.7" step="0.05" class="gothic-slider">
+                        </div>
+                        <div class="form-group">
+                            <label for="rlScaleSliderConfig">RL Influence: <span id="rlScaleValueConfig">1.0</span></label>
+                            <input type="range" id="rlScaleSliderConfig" min="0" max="5" value="1" step="0.1" class="gothic-slider">
+                        </div>
+                        <div class="form-group">
                             <label>Analysis Mode:</label>
                             <div class="radio-group">
                                 <input type="radio" id="modeFusion" name="analysisMode" value="fusion" checked>
@@ -220,6 +228,10 @@
                             <span id="trajectoryDeviation">-</span>
                         </div>
                     </div>
+                    <!-- Moved: Time-Series Visualization into same card -->
+                    <div style="margin-top: 16px;">
+                        <canvas id="timeseriesCanvas" class="gothic-canvas"></canvas>
+                    </div>
                 </div>
             </section>
 
@@ -360,6 +372,23 @@
                             <h3><i class="fas fa-magic"></i> Feedback Impact</h3>
                             <div class="impact-content">
                                 <p id="feedbackImpactText">Submit feedback to see how it influences the music generation.</p>
+                            </div>
+                        </div>
+
+                        <!-- RL Details -->
+                        <div class="feedback-section rl-details-section" style="margin-top:12px;">
+                            <h3><i class="fas fa-chart-line"></i> RL Details</h3>
+                            <div class="rl-details-grid">
+                                <div>
+                                    <div class="metric-item"><span class="label">Latest Reward:</span> <span id="rlLatestReward">0.000</span></div>
+                                    <div class="metric-item"><span class="label">Policy Temp (α):</span> <span id="rlAlpha">0.000</span></div>
+                                </div>
+                                <div>
+                                    <table class="gothic-table" style="width:100%; font-size: 12px;">
+                                        <thead><tr><th>Param</th><th>Δ Action</th><th>Current</th></tr></thead>
+                                        <tbody id="rlActionTable"></tbody>
+                                    </table>
+                                </div>
                             </div>
                         </div>
                     </div>

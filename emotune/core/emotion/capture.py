@@ -160,6 +160,10 @@ class EmotionCapture:
                 if not self._initialize_camera():
                     raise RuntimeError("Failed to initialize camera")
                 
+                # Reinitialize audio capture
+                if not self._reinitialize_audio():
+                    logger.warning("Audio reinitialization failed, but continuing with camera only")
+                
                 self.running = True
                 self.capture_thread = threading.Thread(
                     target=self._capture_loop, 
@@ -270,7 +274,17 @@ class EmotionCapture:
             # Force sounddevice cleanup
             try:
                 sd.stop()  # Stop all streams
-                sd.close()  # Close sounddevice
+                # Note: sounddevice doesn't have a close() method
+                # The stop() call above should be sufficient
+                
+                # Additional cleanup: try to reset PortAudio
+                try:
+                    import sounddevice as sd_module
+                    if hasattr(sd_module, 'default') and hasattr(sd_module.default, 'reset'):
+                        sd_module.default.reset()
+                except Exception as e:
+                    logger.debug(f"PortAudio reset error: {e}")
+                    
             except Exception as e:
                 logger.debug(f"Sounddevice cleanup error: {e}")
             
@@ -279,10 +293,36 @@ class EmotionCapture:
             self._audio_stream = None
             self._audio_device = None
             
+            # Clear latest audio buffer
+            with self._audio_lock:
+                self._latest_audio = None
+            
             logger.info("Audio resources forcefully cleaned up")
             
         except Exception as e:
             logger.error(f"Error during audio cleanup: {e}")
+
+    def _reinitialize_audio(self):
+        """Reinitialize audio capture after cleanup"""
+        try:
+            logger.info("Reinitializing audio capture...")
+            
+            # Clear any existing audio state
+            with self._audio_lock:
+                self._latest_audio = None
+            
+            # Test audio capture to ensure it's working
+            test_audio = self._capture_audio_safe()
+            if test_audio is not None:
+                logger.info("Audio capture reinitialized successfully")
+                return True
+            else:
+                logger.warning("Audio capture test failed during reinitialization")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error reinitializing audio: {e}")
+            return False
 
     def _force_cleanup_camera(self):
         """Force cleanup of camera resources"""
@@ -404,11 +444,16 @@ class EmotionCapture:
         """Dedicated loop for continuous audio capture"""
         logger.info("Starting audio capture loop...")
         
+        consecutive_audio_failures = 0
+        max_consecutive_failures = 5
+        
         try:
             while self.running and not self._shutdown_event.is_set():
                 audio_chunk = self._capture_audio_safe()
                 
                 if audio_chunk is not None:
+                    consecutive_audio_failures = 0  # Reset failure counter
+                    
                     # Update latest buffered audio for pairing
                     with self._audio_lock:
                         self._latest_audio = audio_chunk
@@ -423,6 +468,15 @@ class EmotionCapture:
                     except queue.Full:
                         pass
                     self._capture_stats['audio_chunks'] += 1
+                    
+                    # Log audio capture success occasionally
+                    if self._capture_stats['audio_chunks'] % 10 == 0:
+                        logger.debug(f"Audio capture working: {self._capture_stats['audio_chunks']} chunks captured")
+                else:
+                    consecutive_audio_failures += 1
+                    if consecutive_audio_failures >= max_consecutive_failures:
+                        logger.warning(f"Audio capture failing: {consecutive_audio_failures} consecutive failures")
+                        consecutive_audio_failures = 0  # Reset to avoid spam
                 
                 # Sleep for the duration of the audio chunk to avoid constant recapture
                 time.sleep(self.audio_duration)
@@ -481,18 +535,29 @@ class EmotionCapture:
             if not self.running or self._shutdown_event.is_set():
                 return None
 
-            audio_data = sd.rec(
-                self._audio_buffer_size,
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype='float32',
-                blocking=True  # Use blocking call for simplicity
-            )
-            sd.wait() # Wait for recording to complete
+            # Use a more robust audio capture approach
+            try:
+                audio_data = sd.rec(
+                    self._audio_buffer_size,
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype='float32',
+                    blocking=True  # Use blocking call for simplicity
+                )
+                sd.wait() # Wait for recording to complete
 
-            if audio_data is not None:
-                return audio_data.flatten()
-            return None
+                if audio_data is not None:
+                    return audio_data.flatten()
+                return None
+            except sd.PortAudioError as pae:
+                logger.warning(f"PortAudio error during capture: {pae}")
+                # Try to recover by stopping and restarting sounddevice
+                try:
+                    sd.stop()
+                    time.sleep(0.1)  # Brief pause
+                except Exception as e:
+                    logger.debug(f"Error during sounddevice recovery: {e}")
+                return None
 
         except Exception as e:
             logger.error(f"Audio capture error: {e}")
@@ -520,6 +585,32 @@ class EmotionCapture:
     def get_stats(self) -> Dict:
         """Get capture statistics"""
         return self._capture_stats.copy()
+
+    def is_audio_working(self) -> bool:
+        """Check if audio capture is working properly"""
+        try:
+            # Check if we have recent audio data
+            with self._audio_lock:
+                has_recent_audio = self._latest_audio is not None
+            
+            # Check if we're capturing audio chunks
+            audio_chunks_captured = self._capture_stats.get('audio_chunks', 0)
+            
+            # Check if we have errors
+            audio_errors = self._capture_stats.get('errors', 0)
+            
+            # Audio is working if we have recent data and are capturing chunks
+            audio_working = has_recent_audio and audio_chunks_captured > 0 and audio_errors < 10
+            
+            logger.debug(f"Audio status check: has_recent_audio={has_recent_audio}, "
+                        f"chunks_captured={audio_chunks_captured}, errors={audio_errors}, "
+                        f"working={audio_working}")
+            
+            return audio_working
+            
+        except Exception as e:
+            logger.error(f"Error checking audio status: {e}")
+            return False
 
     def get_last_frame(self) -> Optional[np.ndarray]:
         """Get the last captured BGR frame for preview streaming."""
